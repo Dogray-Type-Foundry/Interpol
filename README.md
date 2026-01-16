@@ -7,7 +7,8 @@
 
 This plugin owes a lot to:
 - [Interpolate](https://github.com/simoncozens/Interpolate/) by [Simon Cozens](https://github.com/simoncozens)
-- [Show Kinks](https://github.com/harbortype/ShowSmoothNodeAngleAndProportion) by [Harbor Type](https://github.com/harbortype)
+- [Show Kinks](https://github.com/harbortype/ShowSmoothNodeAngleAndProportion) by [Henrique Beier](https://github.com/harbortype)
+- [Longboard](https://github.com/LettError/longboardRoboFontExtension) by [Erik van Blokland](https://github.com/LettError)
 - [Smooth-Operator](https://github.com/ryanbugden/Smooth-Operator) by [Ryan Bugden](https://github.com/ryanbugden)
 
 ## Features
