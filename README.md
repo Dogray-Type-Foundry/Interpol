@@ -2,6 +2,14 @@
 
 **Interpol** is a Glyphs plugin for real-time variable font interpolation preview. It allows you to visualize and interact with interpolated glyph shapes, detect interpolation kinks, and fix them using automated tools.
 
+>[!NOTE]
+>This plugin was made in part using Github Copilot and a few different LLM models, mainly Anthropic's Claude 4.5 Sonnet and Opus.
+
+This plugin owes a lot to:
+- [Interpolate](https://github.com/simoncozens/Interpolate/) by [Simon Cozens](https://github.com/simoncozens)
+- [Show Kinks](https://github.com/harbortype/ShowSmoothNodeAngleAndProportion) by [Harbor Type](https://github.com/harbortype)
+- [Smooth-Operator](https://github.com/ryanbugden/Smooth-Operator) by [Ryan Bugden](https://github.com/ryanbugden)
+
 ## Features
 
 - **Live Interpolation Preview** - See interpolated glyphs in real-time as you edit masters
@@ -229,4 +237,4 @@ Click **”Reset to Defaults”** to restore all original settings.
 
 **Version:** 3.0  
 **Author:** José Solé @ Dogray Type Foundry
-**License:** [Your License]
+**License:** MIT
