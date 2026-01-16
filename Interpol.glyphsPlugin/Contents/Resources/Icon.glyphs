@@ -1,0 +1,294 @@
+{
+.appVersion = "3508";
+.formatVersion = 3;
+DisplayStrings = (
+"/toolbarIconTemplate"
+);
+customParameters = (
+{
+name = "Point To Unit Ratio";
+value = 10;
+}
+);
+date = "2025-05-18 19:11:44 +0000";
+familyName = "New Font";
+fontMaster = (
+{
+customParameters = (
+{
+name = "Preview Descender";
+value = 0;
+}
+);
+id = "7684949A-14C3-4E15-9070-3ED6616EDEE8";
+metricValues = (
+{
+pos = 180;
+},
+{
+},
+{
+}
+);
+name = Regular;
+}
+);
+glyphs = (
+{
+category = Icon;
+glyphname = toolbarIconTemplate;
+lastChange = "2026-01-14 10:54:41 +0000";
+layers = (
+{
+attr = {
+color = 1;
+};
+layerId = "7684949A-14C3-4E15-9070-3ED6616EDEE8";
+shapes = (
+{
+attr = {
+strokeColor = (64,255);
+strokePos = 1;
+strokeWidth = 10;
+};
+closed = 1;
+nodes = (
+(110,48,o),
+(122,67,o),
+(122,90,cs),
+(122,113,o),
+(110,132,o),
+(80,132,cs),
+(50,132,o),
+(38,113,o),
+(38,90,cs),
+(38,67,o),
+(50,48,o),
+(80,48,cs)
+);
+},
+{
+attr = {
+strokeColor = (64,255);
+strokePos = -1;
+strokeWidth = 10;
+};
+closed = 1;
+nodes = (
+(104,56,o),
+(114,72,o),
+(114,90,cs),
+(114,109,o),
+(104,124,o),
+(80,124,cs),
+(56,124,o),
+(46,109,o),
+(46,90,cs),
+(46,72,o),
+(56,56,o),
+(80,56,cs)
+);
+},
+{
+attr = {
+strokeColor = (64,255);
+strokePos = 1;
+strokeWidth = 9;
+};
+closed = 1;
+nodes = (
+(85,82,o),
+(87,84,o),
+(87,90,cs),
+(87,96,o),
+(85,98,o),
+(80,98,cs),
+(75,98,o),
+(73,96,o),
+(73,90,cs),
+(73,84,o),
+(75,82,o),
+(80,82,cs)
+);
+},
+{
+attr = {
+strokeColor = (64,255);
+strokePos = "1";
+strokeWidth = 10;
+};
+closed = 1;
+nodes = (
+(123,30,o),
+(140,57,o),
+(140,90,cs),
+(140,123,o),
+(123,150,o),
+(80,150,cs),
+(37,150,o),
+(20,123,o),
+(20,90,cs),
+(20,57,o),
+(37,30,o),
+(80,30,cs)
+);
+}
+);
+userData = {
+com.GeorgSeifert.ImageExportSettings = {
+path = "../Images";
+presets = (
+{
+filename = "{{{glyph.name}}}";
+format = PDF;
+name = default;
+size = 18;
+}
+);
+};
+com.glyphsapp.ImageExportSettings = {
+path = "..";
+presets = (
+{
+filename = "{{{glyph.name}}}";
+format = PDF;
+name = default;
+size = 18;
+}
+);
+};
+};
+width = 160;
+},
+{
+associatedMasterId = "7684949A-14C3-4E15-9070-3ED6616EDEE8";
+attr = {
+color = 1;
+};
+layerId = "4054EE12-DCAD-4211-9189-2A1C6FA2F520";
+name = "Regular 14 Jan 26 at 10:42";
+shapes = (
+{
+attr = {
+fill = 1;
+strokeColor = (0,128);
+strokePos = -1;
+strokeWidth = 10;
+};
+closed = 1;
+nodes = (
+(130,140,l),
+(30,140,l),
+(30,40,l),
+(130,40,l)
+);
+},
+{
+attr = {
+fill = 1;
+strokeColor = (0,128);
+strokePos = 1;
+strokeWidth = 10;
+};
+closed = 1;
+nodes = (
+(140,150,l),
+(110,150,l),
+(110,120,l),
+(140,120,l)
+);
+},
+{
+attr = {
+fill = "1";
+strokeColor = (0,128);
+strokePos = "1";
+strokeWidth = 10;
+};
+closed = 1;
+nodes = (
+(50,150,l),
+(20,150,l),
+(20,120,l),
+(50,120,l)
+);
+},
+{
+attr = {
+fill = "1";
+strokeColor = (0,128);
+strokePos = "1";
+strokeWidth = 10;
+};
+closed = 1;
+nodes = (
+(140,60,l),
+(110,60,l),
+(110,30,l),
+(140,30,l)
+);
+},
+{
+attr = {
+fill = "1";
+strokeColor = (0,128);
+strokePos = "1";
+strokeWidth = 10;
+};
+closed = 1;
+nodes = (
+(50,60,l),
+(20,60,l),
+(20,30,l),
+(50,30,l)
+);
+}
+);
+userData = {
+com.GeorgSeifert.ImageExportSettings = {
+path = "../Images";
+presets = (
+{
+filename = "{{{glyph.name}}}";
+format = PDF;
+name = default;
+size = 18;
+}
+);
+};
+com.glyphsapp.ImageExportSettings = {
+path = "..";
+presets = (
+{
+filename = "{{{glyph.name}}}";
+format = PDF;
+name = default;
+size = 18;
+}
+);
+};
+};
+width = 160;
+}
+);
+}
+);
+metrics = (
+{
+type = ascender;
+},
+{
+type = baseline;
+},
+{
+type = descender;
+}
+);
+settings = {
+gridLength = 10;
+gridSubDivision = 10;
+};
+unitsPerEm = 180;
+versionMajor = 1;
+versionMinor = 0;
+}
