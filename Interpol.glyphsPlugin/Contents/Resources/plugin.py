@@ -91,7 +91,12 @@ from Foundation import NSUserDefaults, NSTimer, NSObject
 
 # Debug flag - set to True to enable debug logging
 DEBUG_INTERPOLATE = False
-DEBUG_DEKINK = True  # Set to True to debug dekinking specifically
+DEBUG_DEKINK = False  # Set to True to debug dekinking specifically
+
+# Disable far on-curve point modifications during dekinking.
+# When True, only handle scale is applied - the far on-curve points are not moved.
+# This prevents crashes with SpeedPunk's KVO observers.
+DISABLE_FAR_ONCURVE_MODIFICATIONS = True
 
 
 def debug_log(msg: str) -> None:
@@ -114,6 +119,339 @@ def dekink_log(msg: str) -> None:
     """Print debug message for dekinking operations."""
     if DEBUG_DEKINK:
         print(f"[Dekink] {msg}")
+
+
+# =============================================================================
+# =============================================================================
+# Curvature Helper - Computes curvature at points on cubic Bezier curves
+# =============================================================================
+
+
+class CurvatureHelper:
+    """
+    Helper class that computes curvature at points along cubic Bezier curves.
+
+    Based on SpeedPunk's approach by Yanone:
+    1. Convert control points to parametric form: P(t) = at³ + bt² + ct + d
+    2. Compute first and second derivatives
+    3. Calculate curvature using: κ = (r1.x * r2.y - r1.y * r2.x) / (r1.x² + r1.y²)^1.5
+
+    Curvature represents how sharply a curve bends at a point:
+    - Positive curvature: bends left
+    - Negative curvature: bends right
+    - Zero curvature: straight line
+    - Higher magnitude: sharper bend
+
+    This is used for curve continuity matching - preserving the curvature at
+    anchor points so that adjacent curves connect smoothly.
+    """
+
+    @staticmethod
+    def solve_cubic_bezier(p0, p1, p2, p3):
+        """
+        Convert control points to parametric cubic form coefficients.
+
+        The cubic Bezier is: P(t) = (1-t)³P0 + 3(1-t)²tP1 + 3(1-t)t²P2 + t³P3
+
+        Expanded to polynomial form: P(t) = at³ + bt² + ct + d
+        where:
+            a = -P0 + 3P1 - 3P2 + P3
+            b = 3P0 - 6P1 + 3P2
+            c = -3P0 + 3P1
+            d = P0
+
+        Args:
+            p0, p1, p2, p3: Control points as (x, y) tuples
+
+        Returns:
+            (a, b, c, d) coefficient tuples, each as (x, y)
+        """
+        a = (
+            -p0[0] + 3.0 * p1[0] - 3.0 * p2[0] + p3[0],
+            -p0[1] + 3.0 * p1[1] - 3.0 * p2[1] + p3[1],
+        )
+        b = (
+            3.0 * p0[0] - 6.0 * p1[0] + 3.0 * p2[0],
+            3.0 * p0[1] - 6.0 * p1[1] + 3.0 * p2[1],
+        )
+        c = (-3.0 * p0[0] + 3.0 * p1[0], -3.0 * p0[1] + 3.0 * p1[1])
+        d = p0
+        return a, b, c, d
+
+    @staticmethod
+    def compute_curvature_at_t(a, b, c, d, t):
+        """
+        Compute curvature at parameter t using the parametric coefficients.
+
+        First derivative:  P'(t)  = 3at² + 2bt + c
+        Second derivative: P''(t) = 6at + 2b
+
+        Curvature formula: κ = (x'y'' - y'x'') / (x'² + y'²)^1.5
+
+        Args:
+            a, b, c, d: Coefficient tuples from solve_cubic_bezier
+            t: Parameter value (0 to 1)
+
+        Returns:
+            Dict with:
+                'position': (x, y) point on curve
+                'derivative1': (dx, dy) first derivative (tangent direction)
+                'derivative2': (ddx, ddy) second derivative
+                'curvature': κ value (can be positive, negative, or 0)
+        """
+        t2 = t * t
+        t3 = t2 * t
+
+        # Position P(t) = at³ + bt² + ct + d
+        pos = (
+            a[0] * t3 + b[0] * t2 + c[0] * t + d[0],
+            a[1] * t3 + b[1] * t2 + c[1] * t + d[1],
+        )
+
+        # First derivative P'(t) = 3at² + 2bt + c
+        r1 = (
+            3.0 * a[0] * t2 + 2.0 * b[0] * t + c[0],
+            3.0 * a[1] * t2 + 2.0 * b[1] * t + c[1],
+        )
+
+        # Second derivative P''(t) = 6at + 2b
+        r2 = (6.0 * a[0] * t + 2.0 * b[0], 6.0 * a[1] * t + 2.0 * b[1])
+
+        # Curvature κ = (x'y'' - y'x'') / (x'² + y'²)^1.5
+        denominator = (r1[0] ** 2 + r1[1] ** 2) ** 1.5
+        if denominator < 1e-10:
+            # Near-zero denominator means velocity is ~0 (degenerate case)
+            curvature = 0.0
+        else:
+            curvature = (r1[0] * r2[1] - r1[1] * r2[0]) / denominator
+
+        return {
+            "position": pos,
+            "derivative1": r1,
+            "derivative2": r2,
+            "curvature": curvature,
+        }
+
+    @staticmethod
+    def get_curvature_at_point(p0, p1, p2, p3, t):
+        """
+        Convenience method to get curvature at parameter t for a curve.
+
+        Args:
+            p0, p1, p2, p3: Control points as (x, y) tuples
+            t: Parameter value (0 to 1)
+
+        Returns:
+            Curvature value (float)
+        """
+        a, b, c, d = CurvatureHelper.solve_cubic_bezier(p0, p1, p2, p3)
+        result = CurvatureHelper.compute_curvature_at_t(a, b, c, d, t)
+        return result["curvature"]
+
+    @staticmethod
+    def get_curvature_at_start(p0, p1, p2, p3):
+        """Get curvature at the start point (t=0) of the curve."""
+        return CurvatureHelper.get_curvature_at_point(p0, p1, p2, p3, 0.0)
+
+    @staticmethod
+    def get_curvature_at_end(p0, p1, p2, p3):
+        """Get curvature at the end point (t=1) of the curve."""
+        return CurvatureHelper.get_curvature_at_point(p0, p1, p2, p3, 1.0)
+
+    @staticmethod
+    def get_tangent_at_point(p0, p1, p2, p3, t):
+        """
+        Get the unit tangent vector at parameter t.
+
+        Args:
+            p0, p1, p2, p3: Control points as (x, y) tuples
+            t: Parameter value (0 to 1)
+
+        Returns:
+            Unit tangent vector as (tx, ty) or (0, 0) if degenerate
+        """
+        a, b, c, d = CurvatureHelper.solve_cubic_bezier(p0, p1, p2, p3)
+        result = CurvatureHelper.compute_curvature_at_t(a, b, c, d, t)
+        r1 = result["derivative1"]
+
+        length = math.hypot(r1[0], r1[1])
+        if length < 1e-10:
+            return (0.0, 0.0)
+        return (r1[0] / length, r1[1] / length)
+
+    @staticmethod
+    def find_handle_position_for_curvature(
+        anchor_pos,
+        target_curvature,
+        tangent_direction,
+        handle_length_hint,
+        is_start_point=True,
+    ):
+        """
+        Find handle position that achieves a target curvature at an anchor point.
+
+        For a curve endpoint, the curvature is determined by:
+        - The handle direction (must be along tangent for smoothness)
+        - The handle length (affects curvature magnitude)
+
+        At t=0: κ = (2/3) * (cross product of first two legs) / (first leg length)³
+        At t=1: κ = (2/3) * (cross product of last two legs) / (last leg length)³
+
+        This is an approximation that works best when the handle is relatively
+        straight from the anchor.
+
+        Args:
+            anchor_pos: Position of the anchor (on-curve) point as (x, y)
+            target_curvature: Desired curvature value
+            tangent_direction: Unit tangent at the anchor (pointing into the curve)
+            handle_length_hint: Approximate desired handle length
+            is_start_point: True if this is at t=0, False if at t=1
+
+        Returns:
+            Handle position as (x, y), or None if impossible
+        """
+        if abs(target_curvature) < 1e-10:
+            # Zero curvature - handle should be along tangent at any length
+            return (
+                anchor_pos[0] + tangent_direction[0] * handle_length_hint,
+                anchor_pos[1] + tangent_direction[1] * handle_length_hint,
+            )
+
+        # The curvature at an endpoint relates to the perpendicular offset of
+        # the handle from the tangent line. A larger perpendicular offset
+        # increases curvature.
+        #
+        # For small handle lengths relative to curve size:
+        # κ ≈ 2 * perp_offset / handle_length²
+        #
+        # So: perp_offset ≈ κ * handle_length² / 2
+
+        perp_offset = target_curvature * handle_length_hint**2 / 2.0
+
+        # Perpendicular direction (90° rotation of tangent)
+        # Positive curvature = curve bends left, so perpendicular is to the left
+        perp_dir = (-tangent_direction[1], tangent_direction[0])
+
+        # Handle position = anchor + tangent*length + perp*offset
+        handle_pos = (
+            anchor_pos[0]
+            + tangent_direction[0] * handle_length_hint
+            + perp_dir[0] * perp_offset,
+            anchor_pos[1]
+            + tangent_direction[1] * handle_length_hint
+            + perp_dir[1] * perp_offset,
+        )
+
+        return handle_pos
+
+    @staticmethod
+    def adjust_handle_for_curvature_match(
+        seg_info,
+        target_curvature,
+        new_node_pos,
+        new_near_handle_pos,
+        is_prev_direction,
+        max_iterations=20,
+        tolerance=0.001,
+    ):
+        """
+        Adjust the opposite handle to match a target curvature at the anchor point.
+
+        After dekinking moves the node and near handle, the curvature at the
+        anchor (far end) of the curve segment may change. This function finds
+        an adjustment to the opposite handle to restore the original curvature.
+
+        Args:
+            seg_info: Original segment info dict
+            target_curvature: The curvature we want at the anchor point
+            new_node_pos: New position of the node (after dekinking)
+            new_near_handle_pos: New position of the near handle (after dekinking)
+            is_prev_direction: True if this is a "prev" curve
+            max_iterations: Maximum iterations for binary search
+            tolerance: Acceptable error in curvature matching
+
+        Returns:
+            Recommended handle scale factor, or 1.0 if no adjustment needed
+        """
+        if not seg_info["is_curve"]:
+            return 1.0
+
+        opp_handle_node = seg_info.get("opp_handle_node")
+        if opp_handle_node is None:
+            return 1.0
+
+        # Build curve points based on direction
+        if is_prev_direction:
+            # PREV: anchor(p0) -> opp_handle(p1) -> near_handle(p2) -> node(p3)
+            anchor = seg_info["p0"]
+            opp_handle_orig = seg_info["p1"]
+            # Target curvature is at t=0 (anchor end)
+            t_target = 0.0
+        else:
+            # NEXT: node(p0) -> near_handle(p1) -> opp_handle(p2) -> anchor(p3)
+            anchor = seg_info["p3"]
+            opp_handle_orig = seg_info["p2"]
+            # Target curvature is at t=1 (anchor end)
+            t_target = 1.0
+
+        # Direction from anchor to original opposite handle
+        handle_dir = (opp_handle_orig[0] - anchor[0], opp_handle_orig[1] - anchor[1])
+        handle_length = math.hypot(handle_dir[0], handle_dir[1])
+
+        if handle_length < 1e-6:
+            return 1.0
+
+        # Binary search for handle scale that achieves target curvature
+        low_scale, high_scale = 0.5, 1.5
+        best_scale = 1.0
+        best_error = float("inf")
+
+        for _ in range(max_iterations):
+            mid_scale = (low_scale + high_scale) / 2
+
+            # Build curve with scaled handle
+            opp_handle_new = (
+                anchor[0] + handle_dir[0] * mid_scale,
+                anchor[1] + handle_dir[1] * mid_scale,
+            )
+
+            if is_prev_direction:
+                p0, p1, p2, p3 = (
+                    anchor,
+                    opp_handle_new,
+                    new_near_handle_pos,
+                    new_node_pos,
+                )
+            else:
+                p0, p1, p2, p3 = (
+                    new_node_pos,
+                    new_near_handle_pos,
+                    opp_handle_new,
+                    anchor,
+                )
+
+            # Compute curvature at anchor
+            curvature = CurvatureHelper.get_curvature_at_point(p0, p1, p2, p3, t_target)
+            error = abs(curvature - target_curvature)
+
+            if error < best_error:
+                best_error = error
+                best_scale = mid_scale
+
+            if error < tolerance:
+                return mid_scale
+
+            # Adjust search based on curvature comparison
+            # Higher scale generally increases the handle length, which can
+            # increase or decrease curvature depending on the curve shape
+            if curvature < target_curvature:
+                # Need more curvature - try both directions to find which helps
+                # This depends on the sign and shape
+                high_scale = mid_scale
+            else:
+                low_scale = mid_scale
+
+        return best_scale
 
 
 # =============================================================================
@@ -573,15 +911,20 @@ class CurveStatisticsHelper:
         new_node_pos,
         is_prev_direction,
         steps=50,
+        curvature_weight=0.3,
     ):
         """
         Find optimal compensation using BOTH opposite handle AND anchor point.
+        Now also considers curve continuity by matching curvature at anchor.
 
         This 2D search adjusts:
         1. The opposite handle (scale along its direction from anchor)
         2. The anchor point itself (small offset to compensate)
 
         Using both control points gives more freedom to match original curve shape.
+
+        NEW: Also tracks curvature at the anchor point to preserve curve continuity
+        with adjacent segments.
 
         Args:
             seg_info: Original segment info dict (geometry BEFORE any moves)
@@ -590,6 +933,7 @@ class CurveStatisticsHelper:
             new_node_pos: New position of the on-curve node (after dekinking move)
             is_prev_direction: True if this is a "prev" curve
             steps: Number of search iterations per dimension
+            curvature_weight: How much to weight curvature matching (0-1, 0=ignore, 1=full)
 
         Returns:
             (best_handle_scale, best_anchor_offset, best_similarity) tuple
@@ -600,6 +944,31 @@ class CurveStatisticsHelper:
 
         if target_stats is None:
             return 1.0, (0, 0), 1.0
+
+        # Capture ORIGINAL curvature at anchor point for continuity matching
+        # This is the curvature that the adjacent curve segment expects
+        original_curve = (
+            seg_info["p0"],
+            seg_info["p1"],
+            seg_info["p2"],
+            seg_info["p3"],
+        )
+        if is_prev_direction:
+            # Anchor is at t=0, curvature measured at start of curve
+            original_anchor_curvature = CurvatureHelper.get_curvature_at_start(
+                *original_curve
+            )
+            t_anchor = 0.0
+        else:
+            # Anchor is at t=1, curvature measured at end of curve
+            original_anchor_curvature = CurvatureHelper.get_curvature_at_end(
+                *original_curve
+            )
+            t_anchor = 1.0
+
+        dekink_log(
+            f"        Original curvature at anchor: {original_anchor_curvature:.6f}"
+        )
 
         if is_prev_direction:
             # For PREV curve: anchor(p0) -> opp_handle(p1) -> near_handle(p2) -> node(p3)
@@ -680,7 +1049,7 @@ class CurveStatisticsHelper:
 
         best_scale = 1.0
         best_anchor_offset = (0, 0)
-        best_similarity = 0.0
+        best_score = 0.0  # Combined score: similarity + curvature match
 
         # 2D search: handle scale and anchor offset
         # Handle scale: 0.7 to 1.3
@@ -697,6 +1066,9 @@ class CurveStatisticsHelper:
         else:
             offset_dir = (0, 1)  # Default to vertical
 
+        # Normalize curvature for comparison (avoid division by zero)
+        curvature_reference = max(abs(original_anchor_curvature), 0.001)
+
         for hi in range(handle_steps):
             handle_scale = 0.7 + (1.3 - 0.7) * hi / (handle_steps - 1)
 
@@ -710,20 +1082,48 @@ class CurveStatisticsHelper:
                 )
 
                 points = build_curve(handle_scale, anchor_offset)
+
+                # Compute statistics similarity
                 pen = CurveStatisticsHelper.create_segment_pen(*points)
                 stats = CurveStatisticsHelper.get_segment_stats(pen)
-
                 similarity = CurveStatisticsHelper.compute_similarity(
                     target_stats, stats, position_sensitive=False
                 )
 
-                if similarity > best_similarity:
-                    best_similarity = similarity
+                # Compute curvature at anchor for this candidate
+                candidate_curvature = CurvatureHelper.get_curvature_at_point(
+                    *points, t_anchor
+                )
+
+                # Curvature similarity: 1.0 when matching, decreasing as they differ
+                # Use relative error for robustness across different curve sizes
+                curvature_error = abs(candidate_curvature - original_anchor_curvature)
+                curvature_similarity = max(
+                    0.0, 1.0 - curvature_error / curvature_reference
+                )
+
+                # Combined score: weighted average of shape similarity and curvature match
+                combined_score = (
+                    1.0 - curvature_weight
+                ) * similarity + curvature_weight * curvature_similarity
+
+                if combined_score > best_score:
+                    best_score = combined_score
                     best_scale = handle_scale
                     best_anchor_offset = anchor_offset
 
         dekink_log(
-            f"        2D search: best_scale={best_scale:.3f}, anchor_offset=({best_anchor_offset[0]:.1f}, {best_anchor_offset[1]:.1f}), similarity={best_similarity:.3f}"
+            f"        2D search: best_scale={best_scale:.3f}, anchor_offset=({best_anchor_offset[0]:.1f}, {best_anchor_offset[1]:.1f}), score={best_score:.3f}"
+        )
+
+        # Compute final curvature for logging
+        final_points = build_curve(best_scale, best_anchor_offset)
+        final_curvature = CurvatureHelper.get_curvature_at_point(
+            *final_points, t_anchor
+        )
+        curvature_change = abs(final_curvature - original_anchor_curvature)
+        dekink_log(
+            f"        Curvature: original={original_anchor_curvature:.6f}, final={final_curvature:.6f}, change={curvature_change:.6f}"
         )
 
         # Clamp handle scale to reasonable range
@@ -751,10 +1151,10 @@ class CurveStatisticsHelper:
             )
 
         dekink_log(
-            f"        final: scale={best_scale:.3f}, anchor_offset=({best_anchor_offset[0]:.1f}, {best_anchor_offset[1]:.1f}), similarity={best_similarity:.3f}"
+            f"        final: scale={best_scale:.3f}, anchor_offset=({best_anchor_offset[0]:.1f}, {best_anchor_offset[1]:.1f}), score={best_score:.3f}"
         )
 
-        return best_scale, best_anchor_offset, best_similarity
+        return best_scale, best_anchor_offset, best_score
 
     @staticmethod
     def evaluate_dekink_quality(original_stats, modified_stats):
@@ -1262,73 +1662,98 @@ class SynchronizationHelper:
 
     @staticmethod
     def find_optimal_compensation_2d(
-        anchor_orig,
+        far_oncurve_orig,
         opp_handle_orig,
         near_handle_new,
         node_new,
         target_samples,
         is_prev_direction,
+        original_curve=None,
         handle_scale_range=(0.7, 1.3),
-        anchor_offset_max=10.0,
+        far_oncurve_offset_max=10.0,
         handle_steps=15,
-        anchor_steps=11,
+        oncurve_steps=11,
+        curvature_weight=0.3,
     ):
         """
-        Find optimal compensation using BOTH opposite handle AND anchor point.
+        Find optimal compensation using BOTH opposite handle AND far on-curve point.
         Uses multiple curve samples for better shape matching than midpoint-only.
+        Also considers curvature continuity at the far on-curve point.
 
         This is the improved compensation for manual mode that matches the
         approach used in auto dekink mode.
 
         Args:
-            anchor_orig: Original position of the anchor point (the on-curve at far end)
+            far_oncurve_orig: Original position of the far on-curve point
             opp_handle_orig: Original position of the opposite handle (to be scaled)
             near_handle_new: New position of the near handle (the one near our node, already moved)
             node_new: New position of our on-curve node (already moved)
             target_samples: List of (x, y) points from original curve at multiple t values
             is_prev_direction: True if prev curve, False if next curve
+            original_curve: (p0, p1, p2, p3) tuple of original curve for curvature calculation
             handle_scale_range: (min, max) scale range for handle adjustment
-            anchor_offset_max: Maximum anchor offset in units
+            far_oncurve_offset_max: Maximum offset for the far on-curve point in units
             handle_steps: Number of handle scale steps to search
-            anchor_steps: Number of anchor offset steps to search
+            oncurve_steps: Number of on-curve offset steps to search
+            curvature_weight: How much to weight curvature matching (0-1)
 
         Returns:
-            (best_handle_scale, best_anchor_offset, best_deviation) tuple
-            anchor_offset is (dx, dy) to add to original anchor position
+            (best_handle_scale, best_oncurve_offset, best_score) tuple
+            best_oncurve_offset is (dx, dy) to add to original far on-curve position
         """
-        # Direction from anchor to opposite handle
+        # Direction from far on-curve to opposite handle
         handle_dir = (
-            opp_handle_orig[0] - anchor_orig[0],
-            opp_handle_orig[1] - anchor_orig[1],
+            opp_handle_orig[0] - far_oncurve_orig[0],
+            opp_handle_orig[1] - far_oncurve_orig[1],
         )
 
+        # Capture original curvature at far on-curve if we have the original curve
+        if original_curve and curvature_weight > 0:
+            if is_prev_direction:
+                # Far on-curve is at t=0 (start of curve)
+                original_oncurve_curvature = CurvatureHelper.get_curvature_at_start(
+                    *original_curve
+                )
+                t_oncurve = 0.0
+            else:
+                # Far on-curve is at t=1 (end of curve)
+                original_oncurve_curvature = CurvatureHelper.get_curvature_at_end(
+                    *original_curve
+                )
+                t_oncurve = 1.0
+            curvature_reference = max(abs(original_oncurve_curvature), 0.001)
+        else:
+            original_oncurve_curvature = None
+            curvature_reference = 1.0
+            t_oncurve = 0.0
+
         if is_prev_direction:
-            # Prev curve: anchor(p0) -> opp_handle(p1) -> near_handle(p2) -> node(p3)
-            def build_curve(handle_scale, anchor_offset):
-                anchor = (
-                    anchor_orig[0] + anchor_offset[0],
-                    anchor_orig[1] + anchor_offset[1],
+            # Prev curve: far_oncurve(p0) -> opp_handle(p1) -> near_handle(p2) -> node(p3)
+            def build_curve(handle_scale, oncurve_offset):
+                far_oncurve = (
+                    far_oncurve_orig[0] + oncurve_offset[0],
+                    far_oncurve_orig[1] + oncurve_offset[1],
                 )
                 p1 = (
-                    anchor[0] + handle_dir[0] * handle_scale,
-                    anchor[1] + handle_dir[1] * handle_scale,
+                    far_oncurve[0] + handle_dir[0] * handle_scale,
+                    far_oncurve[1] + handle_dir[1] * handle_scale,
                 )
-                return (anchor, p1, near_handle_new, node_new)
+                return (far_oncurve, p1, near_handle_new, node_new)
 
         else:
-            # Next curve: node(p0) -> near_handle(p1) -> opp_handle(p2) -> anchor(p3)
-            def build_curve(handle_scale, anchor_offset):
-                anchor = (
-                    anchor_orig[0] + anchor_offset[0],
-                    anchor_orig[1] + anchor_offset[1],
+            # Next curve: node(p0) -> near_handle(p1) -> opp_handle(p2) -> far_oncurve(p3)
+            def build_curve(handle_scale, oncurve_offset):
+                far_oncurve = (
+                    far_oncurve_orig[0] + oncurve_offset[0],
+                    far_oncurve_orig[1] + oncurve_offset[1],
                 )
                 p2 = (
-                    anchor[0] + handle_dir[0] * handle_scale,
-                    anchor[1] + handle_dir[1] * handle_scale,
+                    far_oncurve[0] + handle_dir[0] * handle_scale,
+                    far_oncurve[1] + handle_dir[1] * handle_scale,
                 )
-                return (node_new, near_handle_new, p2, anchor)
+                return (node_new, near_handle_new, p2, far_oncurve)
 
-        # Direction for anchor offset (along handle direction)
+        # Direction for on-curve offset (along handle direction)
         handle_len = (handle_dir[0] ** 2 + handle_dir[1] ** 2) ** 0.5
         if handle_len > 0.1:
             offset_dir = (handle_dir[0] / handle_len, handle_dir[1] / handle_len)
@@ -1336,23 +1761,32 @@ class SynchronizationHelper:
             offset_dir = (0, 1)
 
         best_scale = 1.0
-        best_anchor_offset = (0, 0)
-        best_deviation = float("inf")
+        best_oncurve_offset = (0, 0)
+        best_score = float("inf")  # Lower is better for this method
 
         scale_min, scale_max = handle_scale_range
+
+        # Reference deviation for normalization (deviation at scale=1.0, no offset)
+        ref_points = build_curve(1.0, (0, 0))
+        ref_deviation = 0.0
+        for i, target_pt in enumerate(target_samples):
+            t = (i + 1) / (len(target_samples) + 1)
+            test_pt = SynchronizationHelper.bezier_point(*ref_points, t)
+            ref_deviation += SynchronizationHelper.distance(test_pt, target_pt)
+        ref_deviation = max(ref_deviation, 1.0)  # Avoid division by zero
 
         for hi in range(handle_steps):
             handle_scale = scale_min + (scale_max - scale_min) * hi / (handle_steps - 1)
 
-            for ai in range(anchor_steps):
-                offset_t = -1.0 + 2.0 * ai / (anchor_steps - 1)
-                offset_amount = offset_t * anchor_offset_max
-                anchor_offset = (
+            for ai in range(oncurve_steps):
+                offset_t = -1.0 + 2.0 * ai / (oncurve_steps - 1)
+                offset_amount = offset_t * far_oncurve_offset_max
+                oncurve_offset = (
                     offset_dir[0] * offset_amount,
                     offset_dir[1] * offset_amount,
                 )
 
-                points = build_curve(handle_scale, anchor_offset)
+                points = build_curve(handle_scale, oncurve_offset)
 
                 # Sample the test curve and compare to target samples
                 total_deviation = 0.0
@@ -1363,23 +1797,43 @@ class SynchronizationHelper:
                         test_pt, target_pt
                     )
 
-                if total_deviation < best_deviation:
-                    best_deviation = total_deviation
+                # Normalize deviation to 0-1 range
+                shape_score = total_deviation / ref_deviation
+
+                # Compute curvature score if we have original curvature
+                if original_oncurve_curvature is not None and curvature_weight > 0:
+                    candidate_curvature = CurvatureHelper.get_curvature_at_point(
+                        *points, t_oncurve
+                    )
+                    curvature_error = abs(
+                        candidate_curvature - original_oncurve_curvature
+                    )
+                    curvature_score = curvature_error / curvature_reference
+                else:
+                    curvature_score = 0.0
+
+                # Combined score (lower is better)
+                combined_score = (
+                    1.0 - curvature_weight
+                ) * shape_score + curvature_weight * curvature_score
+
+                if combined_score < best_score:
+                    best_score = combined_score
                     best_scale = handle_scale
-                    best_anchor_offset = anchor_offset
+                    best_oncurve_offset = oncurve_offset
 
         # Clamp results to reasonable ranges
         clamped_scale = max(0.85, min(1.15, best_scale))
 
-        offset_mag = (best_anchor_offset[0] ** 2 + best_anchor_offset[1] ** 2) ** 0.5
-        if offset_mag > anchor_offset_max:
-            scale_factor = anchor_offset_max / offset_mag
-            best_anchor_offset = (
-                best_anchor_offset[0] * scale_factor,
-                best_anchor_offset[1] * scale_factor,
+        offset_mag = (best_oncurve_offset[0] ** 2 + best_oncurve_offset[1] ** 2) ** 0.5
+        if offset_mag > far_oncurve_offset_max:
+            scale_factor = far_oncurve_offset_max / offset_mag
+            best_oncurve_offset = (
+                best_oncurve_offset[0] * scale_factor,
+                best_oncurve_offset[1] * scale_factor,
             )
 
-        return clamped_scale, best_anchor_offset, best_deviation
+        return clamped_scale, best_oncurve_offset, best_score
 
     @staticmethod
     def get_curve_segment_info(node, path, direction):
@@ -2534,28 +2988,31 @@ class SynchronizationHelper:
                     else:
                         anchor_orig = seg_info["p3"]
 
-                    # Apply anchor offset first (move the far on-curve point)
-                    if anchor_node is not None and (
-                        abs(anchor_offset[0]) > 0.1 or abs(anchor_offset[1]) > 0.1
+                    # Apply offset to far on-curve point if enabled
+                    # (Disabled by default to prevent crashes with SpeedPunk's KVO)
+                    if (
+                        not DISABLE_FAR_ONCURVE_MODIFICATIONS
+                        and anchor_node is not None
+                        and (abs(anchor_offset[0]) > 0.1 or abs(anchor_offset[1]) > 0.1)
                     ):
-                        new_anchor_pos = (
+                        new_oncurve_pos = (
                             anchor_orig[0] + anchor_offset[0],
                             anchor_orig[1] + anchor_offset[1],
                         )
                         dekink_log(
-                            f"      MOVING anchor from {anchor_orig} to ({new_anchor_pos[0]:.1f}, {new_anchor_pos[1]:.1f})"
+                            f"      MOVING far on-curve from {anchor_orig} to ({new_oncurve_pos[0]:.1f}, {new_oncurve_pos[1]:.1f})"
                         )
                         anchor_node.position = NSPoint(
-                            round(new_anchor_pos[0]), round(new_anchor_pos[1])
+                            round(new_oncurve_pos[0]), round(new_oncurve_pos[1])
                         )
-                        # Update anchor for handle calculation
-                        anchor = new_anchor_pos
+                        # Update reference for handle calculation
+                        far_oncurve = new_oncurve_pos
                     else:
-                        anchor = anchor_orig
+                        far_oncurve = anchor_orig
 
-                    # Apply handle scale (relative to potentially moved anchor)
+                    # Apply handle scale (relative to potentially moved on-curve)
                     opp_pos = (opp_handle.position.x, opp_handle.position.y)
-                    # Use original handle direction, but from new anchor position
+                    # Use original handle direction, but from new on-curve position
                     if direction == "prev":
                         orig_handle_dir = (
                             seg_info["p1"][0] - seg_info["p0"][0],
@@ -2568,13 +3025,13 @@ class SynchronizationHelper:
                         )
 
                     dekink_log(
-                        f"      anchor={anchor}, orig_handle_dir=({orig_handle_dir[0]:.1f}, {orig_handle_dir[1]:.1f})"
+                        f"      far_oncurve={far_oncurve}, orig_handle_dir=({orig_handle_dir[0]:.1f}, {orig_handle_dir[1]:.1f})"
                     )
 
                     if abs(orig_handle_dir[0]) > 0.1 or abs(orig_handle_dir[1]) > 0.1:
                         new_opp_pos = (
-                            anchor[0] + orig_handle_dir[0] * best_scale,
-                            anchor[1] + orig_handle_dir[1] * best_scale,
+                            far_oncurve[0] + orig_handle_dir[0] * best_scale,
+                            far_oncurve[1] + orig_handle_dir[1] * best_scale,
                         )
                         dekink_log(
                             f"      MOVING opp_handle to: ({new_opp_pos[0]:.1f}, {new_opp_pos[1]:.1f})"
@@ -3625,6 +4082,14 @@ class SynchronizationHelper:
                             # Original handle direction
                             p1_orig = info["p1"]
 
+                            # Original curve for curvature continuity
+                            original_curve = (
+                                info["p0"],
+                                info["p1"],
+                                info["p2"],
+                                info["p3"],
+                            )
+
                             # Use 2D search if we have samples, else fall back to midpoint
                             if len(target_samples) > 1:
                                 best_scale, anchor_offset, _ = (
@@ -3635,6 +4100,7 @@ class SynchronizationHelper:
                                         p3_new,
                                         target_samples,
                                         is_prev_direction=True,
+                                        original_curve=original_curve,
                                     )
                                 )
                             else:
@@ -3652,21 +4118,26 @@ class SynchronizationHelper:
                                 )
                                 anchor_offset = (0, 0)
 
-                            # Apply anchor offset first
-                            if opp_oncurve is not None and (
-                                abs(anchor_offset[0]) > 0.1
-                                or abs(anchor_offset[1]) > 0.1
+                            # Apply offset to far on-curve point if enabled
+                            # (Disabled by default to prevent crashes with SpeedPunk's KVO)
+                            if (
+                                not DISABLE_FAR_ONCURVE_MODIFICATIONS
+                                and opp_oncurve is not None
+                                and (
+                                    abs(anchor_offset[0]) > 0.1
+                                    or abs(anchor_offset[1]) > 0.1
+                                )
                             ):
-                                new_anchor = (
+                                new_oncurve = (
                                     anchor_orig[0] + anchor_offset[0],
                                     anchor_orig[1] + anchor_offset[1],
                                 )
                                 opp_oncurve.position = NSPoint(
-                                    round(new_anchor[0]), round(new_anchor[1])
+                                    round(new_oncurve[0]), round(new_oncurve[1])
                                 )
-                                anchor = new_anchor
+                                far_oncurve = new_oncurve
                             else:
-                                anchor = anchor_orig
+                                far_oncurve = anchor_orig
 
                             # Apply handle scale
                             p1_dir = (
@@ -3675,14 +4146,14 @@ class SynchronizationHelper:
                             )
                             if abs(p1_dir[0]) > 0.1 or abs(p1_dir[1]) > 0.1:
                                 new_p1 = (
-                                    anchor[0] + p1_dir[0] * best_scale,
-                                    anchor[1] + p1_dir[1] * best_scale,
+                                    far_oncurve[0] + p1_dir[0] * best_scale,
+                                    far_oncurve[1] + p1_dir[1] * best_scale,
                                 )
                                 opp_handle.position = NSPoint(
                                     round(new_p1[0]), round(new_p1[1])
                                 )
 
-                        # Compensate "next" curve using 2D search (handle + anchor)
+                        # Compensate "next" curve using 2D search (handle + on-curve)
                         # Structure: p0 (corresponding) -> p1 (our handle) -> p2 (opp_handle) -> p3 (next_oncurve)
                         # p0 and p1 have moved, we adjust p2 and p3 to preserve curve shape
                         if "next" in curve_info and next_node.type == GSOFFCURVE:
@@ -3702,6 +4173,14 @@ class SynchronizationHelper:
                             # Original handle position
                             p2_orig = info["p2"]
 
+                            # Original curve for curvature continuity
+                            original_curve = (
+                                info["p0"],
+                                info["p1"],
+                                info["p2"],
+                                info["p3"],
+                            )
+
                             # Use 2D search if we have samples
                             # Args: anchor_orig, opp_handle_orig, near_handle_new, node_new
                             if len(target_samples) > 1:
@@ -3713,6 +4192,7 @@ class SynchronizationHelper:
                                         p0_new,
                                         target_samples,
                                         is_prev_direction=False,
+                                        original_curve=original_curve,
                                     )
                                 )
                             else:
@@ -3730,21 +4210,26 @@ class SynchronizationHelper:
                                 )
                                 anchor_offset = (0, 0)
 
-                            # Apply anchor offset first
-                            if opp_oncurve is not None and (
-                                abs(anchor_offset[0]) > 0.1
-                                or abs(anchor_offset[1]) > 0.1
+                            # Apply offset to far on-curve point if enabled
+                            # (Disabled by default to prevent crashes with SpeedPunk's KVO)
+                            if (
+                                not DISABLE_FAR_ONCURVE_MODIFICATIONS
+                                and opp_oncurve is not None
+                                and (
+                                    abs(anchor_offset[0]) > 0.1
+                                    or abs(anchor_offset[1]) > 0.1
+                                )
                             ):
-                                new_anchor = (
+                                new_oncurve = (
                                     anchor_orig[0] + anchor_offset[0],
                                     anchor_orig[1] + anchor_offset[1],
                                 )
                                 opp_oncurve.position = NSPoint(
-                                    round(new_anchor[0]), round(new_anchor[1])
+                                    round(new_oncurve[0]), round(new_oncurve[1])
                                 )
-                                anchor = new_anchor
+                                far_oncurve = new_oncurve
                             else:
-                                anchor = anchor_orig
+                                far_oncurve = anchor_orig
 
                             # Apply handle scale
                             p2_dir = (
@@ -3753,8 +4238,8 @@ class SynchronizationHelper:
                             )
                             if abs(p2_dir[0]) > 0.1 or abs(p2_dir[1]) > 0.1:
                                 new_p2 = (
-                                    anchor[0] + p2_dir[0] * best_scale,
-                                    anchor[1] + p2_dir[1] * best_scale,
+                                    far_oncurve[0] + p2_dir[0] * best_scale,
+                                    far_oncurve[1] + p2_dir[1] * best_scale,
                                 )
                                 opp_handle.position = NSPoint(
                                     round(new_p2[0]), round(new_p2[1])
@@ -4008,6 +4493,14 @@ class SynchronizationHelper:
                             )  # Our handle's new position
                             p3_new = (new_pt_x, new_pt_y)  # Our node's new position
 
+                            # Original curve for curvature continuity
+                            original_curve = (
+                                info["p0"],
+                                info["p1"],
+                                info["p2"],
+                                info["p3"],
+                            )
+
                             # Use 2D search if we have samples
                             if len(target_samples) > 1:
                                 best_scale, anchor_offset, _ = (
@@ -4018,6 +4511,7 @@ class SynchronizationHelper:
                                         p3_new,
                                         target_samples,
                                         is_prev_direction=True,
+                                        original_curve=original_curve,
                                     )
                                 )
                             else:
@@ -4102,6 +4596,14 @@ class SynchronizationHelper:
                                 new_next_y,
                             )  # Our handle's new position
 
+                            # Original curve for curvature continuity
+                            original_curve = (
+                                info["p0"],
+                                info["p1"],
+                                info["p2"],
+                                info["p3"],
+                            )
+
                             # Use 2D search if we have samples
                             # Args: anchor_orig, opp_handle_orig, near_handle_new, node_new
                             if len(target_samples) > 1:
@@ -4113,6 +4615,7 @@ class SynchronizationHelper:
                                         p0_new,
                                         target_samples,
                                         is_prev_direction=False,
+                                        original_curve=original_curve,
                                     )
                                 )
                             else:
@@ -7231,7 +7734,23 @@ class InterpolateState:
                 )
             locations.append(normalized_location)
 
-        self.model = VariationModel(locations)
+        # Check for duplicate locations - VariationModel requires unique locations
+        # This can happen with certain font setups (e.g., brace layers, duplicate masters)
+        location_tuples = [tuple(sorted(loc.items())) for loc in locations]
+        if len(location_tuples) != len(set(location_tuples)):
+            debug_log("build_model(): Duplicate locations found, cannot build model")
+            self.model = None
+            self._model_master_ids = None
+            return
+
+        try:
+            self.model = VariationModel(locations)
+        except Exception as e:
+            debug_log(f"build_model(): Failed to build model: {e}")
+            self.model = None
+            self._model_master_ids = None
+            return
+
         debug_log(
             f"build_model(): Model built successfully with {len(locations)} locations"
         )
