@@ -1261,6 +1261,127 @@ class SynchronizationHelper:
         return best_scale
 
     @staticmethod
+    def find_optimal_compensation_2d(
+        anchor_orig,
+        opp_handle_orig,
+        near_handle_new,
+        node_new,
+        target_samples,
+        is_prev_direction,
+        handle_scale_range=(0.7, 1.3),
+        anchor_offset_max=10.0,
+        handle_steps=15,
+        anchor_steps=11,
+    ):
+        """
+        Find optimal compensation using BOTH opposite handle AND anchor point.
+        Uses multiple curve samples for better shape matching than midpoint-only.
+
+        This is the improved compensation for manual mode that matches the
+        approach used in auto dekink mode.
+
+        Args:
+            anchor_orig: Original position of the anchor point (the on-curve at far end)
+            opp_handle_orig: Original position of the opposite handle (to be scaled)
+            near_handle_new: New position of the near handle (the one near our node, already moved)
+            node_new: New position of our on-curve node (already moved)
+            target_samples: List of (x, y) points from original curve at multiple t values
+            is_prev_direction: True if prev curve, False if next curve
+            handle_scale_range: (min, max) scale range for handle adjustment
+            anchor_offset_max: Maximum anchor offset in units
+            handle_steps: Number of handle scale steps to search
+            anchor_steps: Number of anchor offset steps to search
+
+        Returns:
+            (best_handle_scale, best_anchor_offset, best_deviation) tuple
+            anchor_offset is (dx, dy) to add to original anchor position
+        """
+        # Direction from anchor to opposite handle
+        handle_dir = (
+            opp_handle_orig[0] - anchor_orig[0],
+            opp_handle_orig[1] - anchor_orig[1],
+        )
+
+        if is_prev_direction:
+            # Prev curve: anchor(p0) -> opp_handle(p1) -> near_handle(p2) -> node(p3)
+            def build_curve(handle_scale, anchor_offset):
+                anchor = (
+                    anchor_orig[0] + anchor_offset[0],
+                    anchor_orig[1] + anchor_offset[1],
+                )
+                p1 = (
+                    anchor[0] + handle_dir[0] * handle_scale,
+                    anchor[1] + handle_dir[1] * handle_scale,
+                )
+                return (anchor, p1, near_handle_new, node_new)
+
+        else:
+            # Next curve: node(p0) -> near_handle(p1) -> opp_handle(p2) -> anchor(p3)
+            def build_curve(handle_scale, anchor_offset):
+                anchor = (
+                    anchor_orig[0] + anchor_offset[0],
+                    anchor_orig[1] + anchor_offset[1],
+                )
+                p2 = (
+                    anchor[0] + handle_dir[0] * handle_scale,
+                    anchor[1] + handle_dir[1] * handle_scale,
+                )
+                return (node_new, near_handle_new, p2, anchor)
+
+        # Direction for anchor offset (along handle direction)
+        handle_len = (handle_dir[0] ** 2 + handle_dir[1] ** 2) ** 0.5
+        if handle_len > 0.1:
+            offset_dir = (handle_dir[0] / handle_len, handle_dir[1] / handle_len)
+        else:
+            offset_dir = (0, 1)
+
+        best_scale = 1.0
+        best_anchor_offset = (0, 0)
+        best_deviation = float("inf")
+
+        scale_min, scale_max = handle_scale_range
+
+        for hi in range(handle_steps):
+            handle_scale = scale_min + (scale_max - scale_min) * hi / (handle_steps - 1)
+
+            for ai in range(anchor_steps):
+                offset_t = -1.0 + 2.0 * ai / (anchor_steps - 1)
+                offset_amount = offset_t * anchor_offset_max
+                anchor_offset = (
+                    offset_dir[0] * offset_amount,
+                    offset_dir[1] * offset_amount,
+                )
+
+                points = build_curve(handle_scale, anchor_offset)
+
+                # Sample the test curve and compare to target samples
+                total_deviation = 0.0
+                for i, target_pt in enumerate(target_samples):
+                    t = (i + 1) / (len(target_samples) + 1)
+                    test_pt = SynchronizationHelper.bezier_point(*points, t)
+                    total_deviation += SynchronizationHelper.distance(
+                        test_pt, target_pt
+                    )
+
+                if total_deviation < best_deviation:
+                    best_deviation = total_deviation
+                    best_scale = handle_scale
+                    best_anchor_offset = anchor_offset
+
+        # Clamp results to reasonable ranges
+        clamped_scale = max(0.85, min(1.15, best_scale))
+
+        offset_mag = (best_anchor_offset[0] ** 2 + best_anchor_offset[1] ** 2) ** 0.5
+        if offset_mag > anchor_offset_max:
+            scale_factor = anchor_offset_max / offset_mag
+            best_anchor_offset = (
+                best_anchor_offset[0] * scale_factor,
+                best_anchor_offset[1] * scale_factor,
+            )
+
+        return clamped_scale, best_anchor_offset, best_deviation
+
+    @staticmethod
     def get_curve_segment_info(node, path, direction):
         """
         Get curve segment info for compensation.
@@ -1274,7 +1395,10 @@ class SynchronizationHelper:
             - p0, p1, p2, p3: Control points as (x, y) tuples
             - opp_handle: The opposite handle node (to be adjusted)
             - opp_oncurve_idx: Index of the opposite on-curve node
+            - opp_oncurve_node: The opposite on-curve node (anchor)
             - midpoint: Original curve midpoint at t=0.5
+            - samples: List of curve samples at multiple t values for shape matching
+            - anchor: The anchor point position (p0 for prev, p3 for next)
         Or None if not a curve segment.
         """
         nodes = list(path.nodes)
@@ -1310,6 +1434,9 @@ class SynchronizationHelper:
             p2 = (our_handle.position.x, our_handle.position.y)
             p3 = (node.position.x, node.position.y)
 
+            # Sample curve at multiple t values for better shape matching
+            samples = SynchronizationHelper.sample_curve(p0, p1, p2, p3, num_samples=5)
+
             return {
                 "p0": p0,
                 "p1": p1,
@@ -1317,7 +1444,9 @@ class SynchronizationHelper:
                 "p3": p3,
                 "opp_handle": opp_handle,
                 "opp_oncurve_idx": prev_oncurve_idx,
+                "opp_oncurve_node": prev_oncurve,
                 "midpoint": SynchronizationHelper.get_curve_midpoint(p0, p1, p2, p3),
+                "samples": samples,
                 "anchor": p0,  # p1 scales relative to p0
             }
 
@@ -1350,6 +1479,9 @@ class SynchronizationHelper:
             p2 = (opp_handle.position.x, opp_handle.position.y)
             p3 = (next_oncurve.position.x, next_oncurve.position.y)
 
+            # Sample curve at multiple t values for better shape matching
+            samples = SynchronizationHelper.sample_curve(p0, p1, p2, p3, num_samples=5)
+
             return {
                 "p0": p0,
                 "p1": p1,
@@ -1357,7 +1489,9 @@ class SynchronizationHelper:
                 "p3": p3,
                 "opp_handle": opp_handle,
                 "opp_oncurve_idx": next_oncurve_idx,
+                "opp_oncurve_node": next_oncurve,
                 "midpoint": SynchronizationHelper.get_curve_midpoint(p0, p1, p2, p3),
+                "samples": samples,
                 "anchor": p3,  # p2 scales relative to p3
             }
 
@@ -3463,7 +3597,7 @@ class SynchronizationHelper:
                         corresponding, master_path, target_ratio, off_curve_change
                     )
 
-                    # Now compensate opposite handles to preserve curve midpoints
+                    # Now compensate opposite handles AND anchors to preserve curve shape
                     if compensate_curves:
                         prev_node, next_node = (
                             SynchronizationHelper.get_surrounding_points(
@@ -3471,50 +3605,92 @@ class SynchronizationHelper:
                             )
                         )
 
-                        # Compensate "prev" curve
+                        # Compensate "prev" curve using 2D search (handle + anchor)
                         # Structure: p0 (prev_oncurve) -> p1 (opp_handle) -> p2 (our handle) -> p3 (corresponding)
-                        # p2 has moved, we need to adjust p1
+                        # p2 and p3 have moved, we adjust p0 and p1 to preserve curve shape
                         if "prev" in curve_info and prev_node.type == GSOFFCURVE:
                             info = curve_info["prev"]
                             opp_handle = info["opp_handle"]
-                            target_mid = info["midpoint"]
-                            anchor = info["anchor"]  # p0
+                            opp_oncurve = info.get("opp_oncurve_node")
+                            target_samples = info.get("samples", [info["midpoint"]])
+                            anchor_orig = info["anchor"]  # Original p0
 
                             # Get new positions after ratio change
-                            p0 = anchor
                             p2_new = (prev_node.position.x, prev_node.position.y)
                             p3_new = (
                                 corresponding.position.x,
                                 corresponding.position.y,
                             )
 
-                            # Direction from p0 to current p1
-                            p1_current = (opp_handle.position.x, opp_handle.position.y)
-                            p1_dir = (p1_current[0] - p0[0], p1_current[1] - p0[1])
+                            # Original handle direction
+                            p1_orig = info["p1"]
 
-                            # Only compensate if we have a meaningful handle
-                            if abs(p1_dir[0]) > 0.1 or abs(p1_dir[1]) > 0.1:
-                                # Find scale that preserves midpoint
-                                best_scale = SynchronizationHelper.find_handle_scale_for_midpoint(
-                                    p0, p1_dir, p2_new, p3_new, target_mid
+                            # Use 2D search if we have samples, else fall back to midpoint
+                            if len(target_samples) > 1:
+                                best_scale, anchor_offset, _ = (
+                                    SynchronizationHelper.find_optimal_compensation_2d(
+                                        anchor_orig,
+                                        p1_orig,
+                                        p2_new,
+                                        p3_new,
+                                        target_samples,
+                                        is_prev_direction=True,
+                                    )
                                 )
+                            else:
+                                # Fall back to midpoint-only method
+                                p1_dir = (
+                                    p1_orig[0] - anchor_orig[0],
+                                    p1_orig[1] - anchor_orig[1],
+                                )
+                                best_scale = SynchronizationHelper.find_handle_scale_for_midpoint(
+                                    anchor_orig,
+                                    p1_dir,
+                                    p2_new,
+                                    p3_new,
+                                    info["midpoint"],
+                                )
+                                anchor_offset = (0, 0)
 
+                            # Apply anchor offset first
+                            if opp_oncurve is not None and (
+                                abs(anchor_offset[0]) > 0.1
+                                or abs(anchor_offset[1]) > 0.1
+                            ):
+                                new_anchor = (
+                                    anchor_orig[0] + anchor_offset[0],
+                                    anchor_orig[1] + anchor_offset[1],
+                                )
+                                opp_oncurve.position = NSPoint(
+                                    round(new_anchor[0]), round(new_anchor[1])
+                                )
+                                anchor = new_anchor
+                            else:
+                                anchor = anchor_orig
+
+                            # Apply handle scale
+                            p1_dir = (
+                                p1_orig[0] - anchor_orig[0],
+                                p1_orig[1] - anchor_orig[1],
+                            )
+                            if abs(p1_dir[0]) > 0.1 or abs(p1_dir[1]) > 0.1:
                                 new_p1 = (
-                                    p0[0] + p1_dir[0] * best_scale,
-                                    p0[1] + p1_dir[1] * best_scale,
+                                    anchor[0] + p1_dir[0] * best_scale,
+                                    anchor[1] + p1_dir[1] * best_scale,
                                 )
                                 opp_handle.position = NSPoint(
                                     round(new_p1[0]), round(new_p1[1])
                                 )
 
-                        # Compensate "next" curve
+                        # Compensate "next" curve using 2D search (handle + anchor)
                         # Structure: p0 (corresponding) -> p1 (our handle) -> p2 (opp_handle) -> p3 (next_oncurve)
-                        # p1 has moved, we need to adjust p2
+                        # p0 and p1 have moved, we adjust p2 and p3 to preserve curve shape
                         if "next" in curve_info and next_node.type == GSOFFCURVE:
                             info = curve_info["next"]
                             opp_handle = info["opp_handle"]
-                            target_mid = info["midpoint"]
-                            anchor = info["anchor"]  # p3
+                            opp_oncurve = info.get("opp_oncurve_node")
+                            target_samples = info.get("samples", [info["midpoint"]])
+                            anchor_orig = info["anchor"]  # Original p3
 
                             # Get new positions after ratio change
                             p0_new = (
@@ -3522,22 +3698,63 @@ class SynchronizationHelper:
                                 corresponding.position.y,
                             )
                             p1_new = (next_node.position.x, next_node.position.y)
-                            p3 = anchor
 
-                            # Direction from p3 to current p2
-                            p2_current = (opp_handle.position.x, opp_handle.position.y)
-                            p2_dir = (p2_current[0] - p3[0], p2_current[1] - p3[1])
+                            # Original handle position
+                            p2_orig = info["p2"]
 
-                            # Only compensate if we have a meaningful handle
-                            if abs(p2_dir[0]) > 0.1 or abs(p2_dir[1]) > 0.1:
-                                # Find scale that preserves midpoint
-                                best_scale = SynchronizationHelper.find_handle_scale_for_midpoint_p2(
-                                    p0_new, p1_new, p2_dir, p3, target_mid
+                            # Use 2D search if we have samples
+                            # Args: anchor_orig, opp_handle_orig, near_handle_new, node_new
+                            if len(target_samples) > 1:
+                                best_scale, anchor_offset, _ = (
+                                    SynchronizationHelper.find_optimal_compensation_2d(
+                                        anchor_orig,
+                                        p2_orig,
+                                        p1_new,
+                                        p0_new,
+                                        target_samples,
+                                        is_prev_direction=False,
+                                    )
                                 )
+                            else:
+                                # Fall back to midpoint-only method
+                                p2_dir = (
+                                    p2_orig[0] - anchor_orig[0],
+                                    p2_orig[1] - anchor_orig[1],
+                                )
+                                best_scale = SynchronizationHelper.find_handle_scale_for_midpoint_p2(
+                                    p0_new,
+                                    p1_new,
+                                    p2_dir,
+                                    anchor_orig,
+                                    info["midpoint"],
+                                )
+                                anchor_offset = (0, 0)
 
+                            # Apply anchor offset first
+                            if opp_oncurve is not None and (
+                                abs(anchor_offset[0]) > 0.1
+                                or abs(anchor_offset[1]) > 0.1
+                            ):
+                                new_anchor = (
+                                    anchor_orig[0] + anchor_offset[0],
+                                    anchor_orig[1] + anchor_offset[1],
+                                )
+                                opp_oncurve.position = NSPoint(
+                                    round(new_anchor[0]), round(new_anchor[1])
+                                )
+                                anchor = new_anchor
+                            else:
+                                anchor = anchor_orig
+
+                            # Apply handle scale
+                            p2_dir = (
+                                p2_orig[0] - anchor_orig[0],
+                                p2_orig[1] - anchor_orig[1],
+                            )
+                            if abs(p2_dir[0]) > 0.1 or abs(p2_dir[1]) > 0.1:
                                 new_p2 = (
-                                    p3[0] + p2_dir[0] * best_scale,
-                                    p3[1] + p2_dir[1] * best_scale,
+                                    anchor[0] + p2_dir[0] * best_scale,
+                                    anchor[1] + p2_dir[1] * best_scale,
                                 )
                                 opp_handle.position = NSPoint(
                                     round(new_p2[0]), round(new_p2[1])
@@ -3767,9 +3984,11 @@ class SynchronizationHelper:
                             round(new_next_y),
                         )
 
-                    # Now apply curve compensation if enabled
+                    # Now apply curve compensation if enabled - using 2D approach (handle + anchor)
                     if compensate_curves:
-                        # Compensate "prev" curve: p2 (our prev handle) moved, adjust p1 (opposite handle)
+                        nodes_list = list(master_path.nodes)
+
+                        # Compensate "prev" curve using 2D search (handle + anchor)
                         # Curve: p0 (prev_oncurve) -> p1 (opp_handle) -> p2 (our handle) -> p3 (our node)
                         if (
                             "prev" in curve_compensation
@@ -3777,40 +3996,84 @@ class SynchronizationHelper:
                         ):
                             info = curve_compensation["prev"]
                             opp_handle = info["opp_handle"]
-                            target_mid = info["midpoint"]
-                            anchor = info["anchor"]  # p0, the previous on-curve
+                            opp_oncurve = info.get("opp_oncurve_node")
+                            target_samples = info.get("samples", [info["midpoint"]])
+                            anchor_orig = info["anchor"]  # p0, the previous on-curve
+                            p1_orig = info["p1"]
 
                             # New positions after ratio sync
-                            p0 = anchor
                             p2_new = (
                                 new_prev_x,
                                 new_prev_y,
                             )  # Our handle's new position
                             p3_new = (new_pt_x, new_pt_y)  # Our node's new position
 
-                            # Direction from anchor (p0) to current opp_handle (p1)
-                            p1_current = (opp_handle.position.x, opp_handle.position.y)
-                            p1_dir = (p1_current[0] - p0[0], p1_current[1] - p0[1])
-
-                            if abs(p1_dir[0]) > 0.1 or abs(p1_dir[1]) > 0.1:
-                                # Find scale that preserves midpoint
+                            # Use 2D search if we have samples
+                            if len(target_samples) > 1:
+                                best_scale, anchor_offset, _ = (
+                                    SynchronizationHelper.find_optimal_compensation_2d(
+                                        anchor_orig,
+                                        p1_orig,
+                                        p2_new,
+                                        p3_new,
+                                        target_samples,
+                                        is_prev_direction=True,
+                                    )
+                                )
+                            else:
+                                p1_dir = (
+                                    p1_orig[0] - anchor_orig[0],
+                                    p1_orig[1] - anchor_orig[1],
+                                )
                                 best_scale = SynchronizationHelper.find_handle_scale_for_midpoint(
-                                    p0, p1_dir, p2_new, p3_new, target_mid
+                                    anchor_orig,
+                                    p1_dir,
+                                    p2_new,
+                                    p3_new,
+                                    info["midpoint"],
                                 )
+                                anchor_offset = (0, 0)
 
+                            # Apply anchor offset to preview
+                            if opp_oncurve is not None and (
+                                abs(anchor_offset[0]) > 0.1
+                                or abs(anchor_offset[1]) > 0.1
+                            ):
+                                new_anchor = (
+                                    anchor_orig[0] + anchor_offset[0],
+                                    anchor_orig[1] + anchor_offset[1],
+                                )
+                                opp_oncurve_idx = nodes_list.index(opp_oncurve)
+                                anchor_flat_idx = node_to_point.get(
+                                    (path_idx, opp_oncurve_idx)
+                                )
+                                if (
+                                    anchor_flat_idx is not None
+                                    and anchor_flat_idx
+                                    < len(preview_points[master_idx])
+                                ):
+                                    preview_points[master_idx][anchor_flat_idx] = (
+                                        round(new_anchor[0]),
+                                        round(new_anchor[1]),
+                                    )
+                                anchor = new_anchor
+                            else:
+                                anchor = anchor_orig
+
+                            # Apply handle scale
+                            p1_dir = (
+                                p1_orig[0] - anchor_orig[0],
+                                p1_orig[1] - anchor_orig[1],
+                            )
+                            if abs(p1_dir[0]) > 0.1 or abs(p1_dir[1]) > 0.1:
                                 new_p1 = (
-                                    p0[0] + p1_dir[0] * best_scale,
-                                    p0[1] + p1_dir[1] * best_scale,
+                                    anchor[0] + p1_dir[0] * best_scale,
+                                    anchor[1] + p1_dir[1] * best_scale,
                                 )
-
-                                # Find flat index for the opposite handle
-                                opp_handle_idx = list(master_path.nodes).index(
-                                    opp_handle
-                                )
+                                opp_handle_idx = nodes_list.index(opp_handle)
                                 opp_flat_idx = node_to_point.get(
                                     (path_idx, opp_handle_idx)
                                 )
-
                                 if opp_flat_idx is not None and opp_flat_idx < len(
                                     preview_points[master_idx]
                                 ):
@@ -3819,7 +4082,7 @@ class SynchronizationHelper:
                                         round(new_p1[1]),
                                     )
 
-                        # Compensate "next" curve: p1 (our next handle) moved, adjust p2 (opposite handle)
+                        # Compensate "next" curve using 2D search (handle + anchor)
                         # Curve: p0 (our node) -> p1 (our handle) -> p2 (opp_handle) -> p3 (next_oncurve)
                         if (
                             "next" in curve_compensation
@@ -3827,8 +4090,10 @@ class SynchronizationHelper:
                         ):
                             info = curve_compensation["next"]
                             opp_handle = info["opp_handle"]
-                            target_mid = info["midpoint"]
-                            anchor = info["anchor"]  # p3, the next on-curve
+                            opp_oncurve = info.get("opp_oncurve_node")
+                            target_samples = info.get("samples", [info["midpoint"]])
+                            anchor_orig = info["anchor"]  # p3, the next on-curve
+                            p2_orig = info["p2"]
 
                             # New positions after ratio sync
                             p0_new = (new_pt_x, new_pt_y)  # Our node's new position
@@ -3836,31 +4101,74 @@ class SynchronizationHelper:
                                 new_next_x,
                                 new_next_y,
                             )  # Our handle's new position
-                            p3 = anchor
 
-                            # Direction from anchor (p3) to current opp_handle (p2)
-                            p2_current = (opp_handle.position.x, opp_handle.position.y)
-                            p2_dir = (p2_current[0] - p3[0], p2_current[1] - p3[1])
-
-                            if abs(p2_dir[0]) > 0.1 or abs(p2_dir[1]) > 0.1:
-                                # Find scale that preserves midpoint
+                            # Use 2D search if we have samples
+                            # Args: anchor_orig, opp_handle_orig, near_handle_new, node_new
+                            if len(target_samples) > 1:
+                                best_scale, anchor_offset, _ = (
+                                    SynchronizationHelper.find_optimal_compensation_2d(
+                                        anchor_orig,
+                                        p2_orig,
+                                        p1_new,
+                                        p0_new,
+                                        target_samples,
+                                        is_prev_direction=False,
+                                    )
+                                )
+                            else:
+                                p2_dir = (
+                                    p2_orig[0] - anchor_orig[0],
+                                    p2_orig[1] - anchor_orig[1],
+                                )
                                 best_scale = SynchronizationHelper.find_handle_scale_for_midpoint_p2(
-                                    p0_new, p1_new, p2_dir, p3, target_mid
+                                    p0_new,
+                                    p1_new,
+                                    p2_dir,
+                                    anchor_orig,
+                                    info["midpoint"],
                                 )
+                                anchor_offset = (0, 0)
 
+                            # Apply anchor offset to preview
+                            if opp_oncurve is not None and (
+                                abs(anchor_offset[0]) > 0.1
+                                or abs(anchor_offset[1]) > 0.1
+                            ):
+                                new_anchor = (
+                                    anchor_orig[0] + anchor_offset[0],
+                                    anchor_orig[1] + anchor_offset[1],
+                                )
+                                opp_oncurve_idx = nodes_list.index(opp_oncurve)
+                                anchor_flat_idx = node_to_point.get(
+                                    (path_idx, opp_oncurve_idx)
+                                )
+                                if (
+                                    anchor_flat_idx is not None
+                                    and anchor_flat_idx
+                                    < len(preview_points[master_idx])
+                                ):
+                                    preview_points[master_idx][anchor_flat_idx] = (
+                                        round(new_anchor[0]),
+                                        round(new_anchor[1]),
+                                    )
+                                anchor = new_anchor
+                            else:
+                                anchor = anchor_orig
+
+                            # Apply handle scale
+                            p2_dir = (
+                                p2_orig[0] - anchor_orig[0],
+                                p2_orig[1] - anchor_orig[1],
+                            )
+                            if abs(p2_dir[0]) > 0.1 or abs(p2_dir[1]) > 0.1:
                                 new_p2 = (
-                                    p3[0] + p2_dir[0] * best_scale,
-                                    p3[1] + p2_dir[1] * best_scale,
+                                    anchor[0] + p2_dir[0] * best_scale,
+                                    anchor[1] + p2_dir[1] * best_scale,
                                 )
-
-                                # Find flat index for the opposite handle
-                                opp_handle_idx = list(master_path.nodes).index(
-                                    opp_handle
-                                )
+                                opp_handle_idx = nodes_list.index(opp_handle)
                                 opp_flat_idx = node_to_point.get(
                                     (path_idx, opp_handle_idx)
                                 )
-
                                 if opp_flat_idx is not None and opp_flat_idx < len(
                                     preview_points[master_idx]
                                 ):
