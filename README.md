@@ -238,4 +238,4 @@ Click **”Reset to Defaults”** to restore all original settings.
 
 **Version:** 3.0  
 **Author:** José Solé @ Dogray Type Foundry
-**License:** MIT
+**License:** Apache-2.0
