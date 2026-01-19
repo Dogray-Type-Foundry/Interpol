@@ -91,6 +91,7 @@ from Foundation import NSUserDefaults, NSTimer, NSObject
 
 # Debug flag - set to True to enable debug logging
 DEBUG_INTERPOLATE = False
+DEBUG_DEKINK = True  # Set to True to debug dekinking specifically
 
 
 def debug_log(msg: str) -> None:
@@ -107,6 +108,12 @@ def debug_log_lazy(msg_func):
     """
     if DEBUG_INTERPOLATE:
         print(f"[Interpol] {msg_func()}")
+
+
+def dekink_log(msg: str) -> None:
+    """Print debug message for dekinking operations."""
+    if DEBUG_DEKINK:
+        print(f"[Dekink] {msg}")
 
 
 # =============================================================================
@@ -560,82 +567,194 @@ class CurveStatisticsHelper:
 
     @staticmethod
     def find_optimal_compensation(
-        seg_info, target_stats, new_p2_or_p1, is_prev_direction, steps=50
+        seg_info,
+        target_stats,
+        new_near_handle_pos,
+        new_node_pos,
+        is_prev_direction,
+        steps=50,
     ):
         """
-        Find optimal handle scale to preserve curve statistics.
+        Find optimal compensation using BOTH opposite handle AND anchor point.
 
-        Uses binary search / gradient descent to find the handle scale that
-        best preserves the original curve statistics.
+        This 2D search adjusts:
+        1. The opposite handle (scale along its direction from anchor)
+        2. The anchor point itself (small offset to compensate)
+
+        Using both control points gives more freedom to match original curve shape.
 
         Args:
-            seg_info: Original segment info dict
-            target_stats: Target statistics to match
-            new_p2_or_p1: New position of our handle (p2 for prev, p1 for next)
+            seg_info: Original segment info dict (geometry BEFORE any moves)
+            target_stats: Target statistics to match (from original curve)
+            new_near_handle_pos: New position of the near handle (the one directly connected to node)
+            new_node_pos: New position of the on-curve node (after dekinking move)
             is_prev_direction: True if this is a "prev" curve
-            steps: Number of search iterations
+            steps: Number of search iterations per dimension
 
         Returns:
-            (best_scale, best_similarity) tuple
+            (best_handle_scale, best_anchor_offset, best_similarity) tuple
+            anchor_offset is (dx, dy) to add to original anchor position
         """
         if not seg_info["is_curve"] or not seg_info.get("opp_handle_node"):
-            return 1.0, 1.0
+            return 1.0, (0, 0), 1.0
 
         if target_stats is None:
-            return 1.0, 1.0
+            return 1.0, (0, 0), 1.0
 
         if is_prev_direction:
-            anchor = seg_info["p0"]
-            p1_original = seg_info["p1"]
-            p3 = seg_info["p3"]
-            p2 = new_p2_or_p1
+            # For PREV curve: anchor(p0) -> opp_handle(p1) -> near_handle(p2) -> node(p3)
+            anchor_orig = seg_info["p0"]
+            p1_original = seg_info["p1"]  # The opposite handle we'll scale
+            p2 = new_near_handle_pos  # The near handle (new position)
+            p3 = new_node_pos  # The node (new position)
 
-            # Direction from anchor to original handle
-            handle_dir = (p1_original[0] - anchor[0], p1_original[1] - anchor[1])
+            # Direction from anchor to original opposite handle
+            handle_dir = (
+                p1_original[0] - anchor_orig[0],
+                p1_original[1] - anchor_orig[1],
+            )
 
-            def build_curve(scale):
+            dekink_log(
+                f"        find_optimal_compensation (PREV): anchor={anchor_orig}, p1_orig={p1_original}, p2_new={p2}, p3_new={p3}"
+            )
+            dekink_log(
+                f"        handle_dir (from anchor to p1_orig): ({handle_dir[0]:.1f}, {handle_dir[1]:.1f})"
+            )
+
+            def build_curve(handle_scale, anchor_offset):
+                anchor = (
+                    anchor_orig[0] + anchor_offset[0],
+                    anchor_orig[1] + anchor_offset[1],
+                )
                 p1 = (
-                    anchor[0] + handle_dir[0] * scale,
-                    anchor[1] + handle_dir[1] * scale,
+                    anchor[0] + handle_dir[0] * handle_scale,
+                    anchor[1] + handle_dir[1] * handle_scale,
                 )
                 return (anchor, p1, p2, p3)
 
         else:
-            anchor = seg_info["p3"]
-            p2_original = seg_info["p2"]
-            p0 = seg_info["p0"]
-            p1 = new_p2_or_p1
+            # For NEXT curve: node(p0) -> near_handle(p1) -> opp_handle(p2) -> anchor(p3)
+            anchor_orig = seg_info["p3"]
+            p2_original = seg_info["p2"]  # The opposite handle we'll scale
+            p0 = new_node_pos  # The node (new position)
+            p1 = new_near_handle_pos  # The near handle (new position)
 
-            # Direction from anchor to original handle
-            handle_dir = (p2_original[0] - anchor[0], p2_original[1] - anchor[1])
+            # Direction from anchor to original opposite handle
+            handle_dir = (
+                p2_original[0] - anchor_orig[0],
+                p2_original[1] - anchor_orig[1],
+            )
 
-            def build_curve(scale):
+            dekink_log(
+                f"        find_optimal_compensation (NEXT): p0_new={p0}, p1_new={p1}, p2_orig={p2_original}, anchor={anchor_orig}"
+            )
+            dekink_log(
+                f"        handle_dir (from anchor to p2_orig): ({handle_dir[0]:.1f}, {handle_dir[1]:.1f})"
+            )
+
+            def build_curve(handle_scale, anchor_offset):
+                anchor = (
+                    anchor_orig[0] + anchor_offset[0],
+                    anchor_orig[1] + anchor_offset[1],
+                )
                 p2 = (
-                    anchor[0] + handle_dir[0] * scale,
-                    anchor[1] + handle_dir[1] * scale,
+                    anchor[0] + handle_dir[0] * handle_scale,
+                    anchor[1] + handle_dir[1] * handle_scale,
                 )
                 return (p0, p1, p2, anchor)
 
+        # Compute the movement vector of the node (how much it moved from original)
+        if is_prev_direction:
+            node_orig = seg_info["p3"]
+        else:
+            node_orig = seg_info["p0"]
+
+        node_movement = (new_node_pos[0] - node_orig[0], new_node_pos[1] - node_orig[1])
+        move_dist = (node_movement[0] ** 2 + node_movement[1] ** 2) ** 0.5
+
+        # Anchor offset range scales with node movement - more movement allows more compensation
+        # But cap it to prevent excessive changes
+        max_anchor_offset = min(
+            move_dist * 0.5, 15.0
+        )  # Up to 50% of node movement, max 15 units
+
         best_scale = 1.0
+        best_anchor_offset = (0, 0)
         best_similarity = 0.0
 
-        # Search over scale range
-        for i in range(steps):
-            scale = 0.5 + (1.5 - 0.5) * i / (steps - 1)  # 0.5 to 1.5
+        # 2D search: handle scale and anchor offset
+        # Handle scale: 0.7 to 1.3
+        # Anchor offset: along curve direction
 
-            points = build_curve(scale)
-            pen = CurveStatisticsHelper.create_segment_pen(*points)
-            stats = CurveStatisticsHelper.get_segment_stats(pen)
+        handle_steps = 15
+        anchor_steps = 11  # -max to +max offset
 
-            similarity = CurveStatisticsHelper.compute_similarity(
-                target_stats, stats, position_sensitive=False
+        # Compute curve direction for anchor offset (perpendicular to handle direction)
+        handle_len = (handle_dir[0] ** 2 + handle_dir[1] ** 2) ** 0.5
+        if handle_len > 0.1:
+            # Offset along handle direction (toward/away from curve)
+            offset_dir = (handle_dir[0] / handle_len, handle_dir[1] / handle_len)
+        else:
+            offset_dir = (0, 1)  # Default to vertical
+
+        for hi in range(handle_steps):
+            handle_scale = 0.7 + (1.3 - 0.7) * hi / (handle_steps - 1)
+
+            for ai in range(anchor_steps):
+                # Offset amount from -max to +max
+                offset_t = -1.0 + 2.0 * ai / (anchor_steps - 1)
+                offset_amount = offset_t * max_anchor_offset
+                anchor_offset = (
+                    offset_dir[0] * offset_amount,
+                    offset_dir[1] * offset_amount,
+                )
+
+                points = build_curve(handle_scale, anchor_offset)
+                pen = CurveStatisticsHelper.create_segment_pen(*points)
+                stats = CurveStatisticsHelper.get_segment_stats(pen)
+
+                similarity = CurveStatisticsHelper.compute_similarity(
+                    target_stats, stats, position_sensitive=False
+                )
+
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_scale = handle_scale
+                    best_anchor_offset = anchor_offset
+
+        dekink_log(
+            f"        2D search: best_scale={best_scale:.3f}, anchor_offset=({best_anchor_offset[0]:.1f}, {best_anchor_offset[1]:.1f}), similarity={best_similarity:.3f}"
+        )
+
+        # Clamp handle scale to reasonable range
+        MIN_SCALE = 0.85
+        MAX_SCALE = 1.15
+        clamped_scale = max(MIN_SCALE, min(MAX_SCALE, best_scale))
+
+        if clamped_scale != best_scale:
+            dekink_log(
+                f"        CLAMPED scale: {best_scale:.3f} -> {clamped_scale:.3f}"
+            )
+            best_scale = clamped_scale
+
+        # Clamp anchor offset magnitude
+        MAX_ANCHOR_OFFSET = 10.0
+        offset_mag = (best_anchor_offset[0] ** 2 + best_anchor_offset[1] ** 2) ** 0.5
+        if offset_mag > MAX_ANCHOR_OFFSET:
+            scale_factor = MAX_ANCHOR_OFFSET / offset_mag
+            best_anchor_offset = (
+                best_anchor_offset[0] * scale_factor,
+                best_anchor_offset[1] * scale_factor,
+            )
+            dekink_log(
+                f"        CLAMPED anchor offset to magnitude {MAX_ANCHOR_OFFSET}"
             )
 
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_scale = scale
+        dekink_log(
+            f"        final: scale={best_scale:.3f}, anchor_offset=({best_anchor_offset[0]:.1f}, {best_anchor_offset[1]:.1f}), similarity={best_similarity:.3f}"
+        )
 
-        return best_scale, best_similarity
+        return best_scale, best_anchor_offset, best_similarity
 
     @staticmethod
     def evaluate_dekink_quality(original_stats, modified_stats):
@@ -667,76 +786,6 @@ class CurveStatisticsHelper:
             return 1.0  # No curves to compare
 
         return total_similarity / count
-
-    @staticmethod
-    def identify_corner_masters(font):
-        """
-        Identify which masters are at corners of the design space.
-
-        Corner masters are at extreme positions on all axes and should be
-        prioritized when dekinking, as they define the interpolation boundaries.
-
-        Args:
-            font: The GSFont
-
-        Returns:
-            Set of master IDs that are corner masters
-        """
-        if not font or not font.masters:
-            return set()
-
-        axes = list(font.axes)
-        if not axes:
-            return {m.id for m in font.masters}
-
-        # Get axis min/max values
-        axis_ranges = []
-        for ax_idx, axis in enumerate(axes):
-            values = [
-                m.internalAxesValues[ax_idx]
-                for m in font.masters
-                if ax_idx < len(m.internalAxesValues)
-            ]
-            if values:
-                axis_ranges.append((min(values), max(values)))
-            else:
-                axis_ranges.append((0, 0))
-
-        corner_masters = set()
-        for master in font.masters:
-            is_corner = True
-            for ax_idx, (ax_min, ax_max) in enumerate(axis_ranges):
-                if ax_idx >= len(master.internalAxesValues):
-                    continue
-                val = master.internalAxesValues[ax_idx]
-                # Must be at min or max of this axis
-                if ax_min != ax_max and val != ax_min and val != ax_max:
-                    is_corner = False
-                    break
-            if is_corner:
-                corner_masters.add(master.id)
-
-        return corner_masters
-
-    @staticmethod
-    def compute_master_weight(master, font, corner_masters):
-        """
-        Compute importance weight for a master.
-
-        Corner masters get higher weight as they define interpolation extremes.
-
-        Args:
-            master: The GSMaster
-            font: The GSFont
-            corner_masters: Set of corner master IDs
-
-        Returns:
-            Weight value (1.0 for non-corner, 2.0+ for corner)
-        """
-        if master.id in corner_masters:
-            # Corner masters are more important
-            return 2.0
-        return 1.0
 
     @staticmethod
     def compute_cross_master_similarity(node_info_list):
@@ -787,6 +836,314 @@ class CurveStatisticsHelper:
             return 1.0
 
         return total_similarity / comparisons
+
+    @staticmethod
+    def get_master_designspace_position(master, font):
+        """
+        Get the normalized position of a master in the designspace.
+
+        Returns a tuple of normalized coordinates (0-1 for each axis).
+        """
+        axes = list(font.axes)
+        if not axes:
+            return (0.5,)  # Single point if no axes
+
+        position = []
+        for i, axis in enumerate(axes):
+            # Get axis min/max from all masters
+            axis_values = [m.axes[i] for m in font.masters]
+            axis_min = min(axis_values)
+            axis_max = max(axis_values)
+
+            if axis_max == axis_min:
+                position.append(0.5)
+            else:
+                master_val = master.axes[i]
+                normalized = (master_val - axis_min) / (axis_max - axis_min)
+                position.append(normalized)
+
+        return tuple(position)
+
+    @staticmethod
+    def find_worst_kink_region(master_data, font):
+        """
+        Find where in the designspace the worst kinking occurs.
+
+        Samples interpolations between masters to find the region
+        where kinks are most severe.
+
+        Args:
+            master_data: List of dicts with 'master', 'ratio', etc.
+            font: The GSFont
+
+        Returns:
+            Tuple of (worst_position, severity) where position is normalized coords
+        """
+        if len(master_data) < 2:
+            return None, 0.0
+
+        # Get ratios and positions
+        ratios = [
+            (
+                d["ratio"],
+                CurveStatisticsHelper.get_master_designspace_position(
+                    d["master"], font
+                ),
+            )
+            for d in master_data
+        ]
+
+        # The worst kink happens where ratios differ most from neighboring masters
+        # For a 2-master case, it's in the middle
+        # For multi-master, find where ratio gradient is steepest
+
+        target_ratio = sum(d["ratio"] for d in master_data) / len(master_data)
+
+        worst_severity = 0.0
+        worst_position = None
+
+        for d in master_data:
+            pos = CurveStatisticsHelper.get_master_designspace_position(
+                d["master"], font
+            )
+            ratio_diff = abs(d["ratio"] - target_ratio)
+
+            if ratio_diff > worst_severity:
+                worst_severity = ratio_diff
+                worst_position = pos
+
+        # The worst kink region is BETWEEN the most different master and the average
+        # So we estimate it as slightly toward the center from the outlier
+        if worst_position:
+            # Move 25% toward center
+            adjusted_pos = tuple(p * 0.75 + 0.5 * 0.25 for p in worst_position)
+            return adjusted_pos, worst_severity
+
+        return (0.5,) * len(font.axes), worst_severity
+
+    @staticmethod
+    def compute_distance_to_region(position, region_position):
+        """
+        Compute Euclidean distance between two designspace positions.
+        """
+        if not position or not region_position:
+            return 1.0
+
+        if len(position) != len(region_position):
+            return 1.0
+
+        dist_sq = sum((a - b) ** 2 for a, b in zip(position, region_position))
+        return math.sqrt(dist_sq)
+
+    @staticmethod
+    def compute_first_pass_movement(master_data, target_ratio):
+        """
+        Simulate a first pass of dekinking to measure how much each master would move.
+
+        Returns a dict mapping master.id to total point movement distance.
+        """
+        dekink_log(f"  compute_first_pass_movement: target_ratio={target_ratio:.4f}")
+        movement_by_master = {}
+
+        for d in master_data:
+            master = d["master"]
+            corresponding = d["node"]
+            master_path = d["path"]
+            current_ratio = d["ratio"]
+
+            # Calculate how positions would change with full blend (1.0)
+            positions = SynchronizationHelper.calculate_positions_for_blend(
+                corresponding, master_path, target_ratio, 1.0, off_curve_change=0.5
+            )
+
+            # Measure movement distances
+            orig_node = (corresponding.position.x, corresponding.position.y)
+            new_node = positions["node_pos"]
+            node_dist = math.hypot(
+                new_node[0] - orig_node[0], new_node[1] - orig_node[1]
+            )
+
+            # Also check handle movements
+            nodes = list(master_path.nodes)
+            num_nodes = len(nodes)
+            corr_idx = nodes.index(corresponding)
+            prev_node = nodes[(corr_idx - 1) % num_nodes]
+            next_node = nodes[(corr_idx + 1) % num_nodes]
+
+            handle_dist = 0.0
+            if prev_node.type == GSOFFCURVE:
+                orig_prev = (prev_node.position.x, prev_node.position.y)
+                new_prev = positions["prev_pos"]
+                handle_dist += math.hypot(
+                    new_prev[0] - orig_prev[0], new_prev[1] - orig_prev[1]
+                )
+
+            if next_node.type == GSOFFCURVE:
+                orig_next = (next_node.position.x, next_node.position.y)
+                new_next = positions["next_pos"]
+                handle_dist += math.hypot(
+                    new_next[0] - orig_next[0], new_next[1] - orig_next[1]
+                )
+
+            # Total movement is node + handles
+            total_movement = node_dist + handle_dist
+            movement_by_master[master.id] = total_movement
+            dekink_log(
+                f"    Master '{master.name}': ratio={current_ratio:.4f}, node_dist={node_dist:.1f}, handle_dist={handle_dist:.1f}, total={total_movement:.1f}"
+            )
+
+        return movement_by_master
+
+    @staticmethod
+    def compute_master_weights(master_data, font, original_stats_by_master):
+        """
+        Compute per-master weights for dekinking using an iterative approach.
+
+        Masters that should change LESS get HIGHER weights.
+        The target ratio will be weighted toward high-weight masters.
+
+        Two-pass approach:
+        1. First pass: simulate dekinking to see which master moves most
+        2. Protect masters that would move too much
+
+        Factors:
+        1. Change protection (60%): Masters that would move the most in first pass
+           get higher weight, so others follow them instead
+        2. Proximity to worst kink region (40%): Masters near the worst kink
+           should absorb more change (lower weight)
+
+        Args:
+            master_data: List of dicts with 'master', 'ratio', 'original_stats', etc.
+            font: The GSFont
+            original_stats_by_master: Dict mapping master.id to original curve stats
+
+        Returns:
+            Dict mapping master.id to weight (0.0-1.0)
+        """
+        if len(master_data) < 2:
+            return {d["master"].id: 1.0 for d in master_data}
+
+        weights = {}
+
+        # Find worst kink region
+        worst_region, worst_severity = CurveStatisticsHelper.find_worst_kink_region(
+            master_data, font
+        )
+
+        # Calculate simple average ratio for first-pass simulation
+        avg_ratio = sum(d["ratio"] for d in master_data) / len(master_data)
+
+        # FIRST PASS: Simulate dekinking to measure actual point movement
+        movement_by_master = CurveStatisticsHelper.compute_first_pass_movement(
+            master_data, avg_ratio
+        )
+
+        # Normalize movement values
+        max_movement = max(movement_by_master.values()) if movement_by_master else 1.0
+        if max_movement < 0.001:
+            max_movement = 1.0
+
+        for d in master_data:
+            master = d["master"]
+            position = CurveStatisticsHelper.get_master_designspace_position(
+                master, font
+            )
+
+            # Factor 1: Change protection based on ACTUAL first-pass movement
+            # Masters that moved the most get HIGHER weight (so others follow them)
+            movement = movement_by_master.get(master.id, 0.0)
+            change_protection_weight = (
+                movement / max_movement
+            )  # 0-1, higher = moved more
+
+            # Factor 2: Distance from worst kink region
+            dist_to_worst = CurveStatisticsHelper.compute_distance_to_region(
+                position, worst_region
+            )
+            # Normalize: closer to worst = lower weight (should change more)
+            # farther from worst = higher weight (should change less)
+            proximity_weight = min(
+                1.0, dist_to_worst / 0.7
+            )  # 0.7 is roughly half diagonal
+
+            # Combine factors:
+            # - Change protection: 60% influence (protect masters that moved most in first pass)
+            # - Proximity to worst kink: 40% influence (masters near problem absorb more)
+            combined_weight = change_protection_weight * 0.60 + proximity_weight * 0.40
+
+            # Ensure minimum weight so no master is completely ignored
+            weights[master.id] = max(0.15, min(1.0, combined_weight))
+
+        # Normalize weights so they sum to 1.0 (for weighted average)
+        total = sum(weights.values())
+        if total > 0:
+            weights = {k: v / total for k, v in weights.items()}
+
+        return weights
+
+    @staticmethod
+    def compute_weighted_target_ratio(master_data, weights):
+        """
+        Compute target ratio as weighted average, favoring high-weight masters.
+
+        Args:
+            master_data: List of dicts with 'master', 'ratio'
+            weights: Dict mapping master.id to weight
+
+        Returns:
+            Weighted target ratio
+        """
+        if not master_data or not weights:
+            return 1.0
+
+        weighted_sum = 0.0
+        weight_sum = 0.0
+
+        for d in master_data:
+            master_id = d["master"].id
+            ratio = d["ratio"]
+            weight = weights.get(master_id, 1.0 / len(master_data))
+
+            weighted_sum += ratio * weight
+            weight_sum += weight
+
+        if weight_sum > 0:
+            return weighted_sum / weight_sum
+
+        return sum(d["ratio"] for d in master_data) / len(master_data)
+
+    @staticmethod
+    def compute_per_master_blend_limits(
+        master_data, weights, font, quality_threshold=0.85
+    ):
+        """
+        Compute maximum allowed blend for each master.
+
+        With 2D compensation (handle + anchor), we can allow more blend
+        since we have better ability to preserve curve shape.
+
+        Args:
+            master_data: List of dicts with 'master', etc.
+            weights: Dict mapping master.id to weight
+            font: The GSFont
+            quality_threshold: Base quality threshold
+
+        Returns:
+            Dict mapping master.id to (max_blend, adjusted_quality_threshold)
+        """
+        limits = {}
+
+        # With anchor compensation, we can allow more aggressive blending
+        # since we can better compensate for the movement
+        GLOBAL_MAX_BLEND = 0.5
+
+        for d in master_data:
+            master_id = d["master"].id
+
+            # All masters get the same blend limit
+            limits[master_id] = (GLOBAL_MAX_BLEND, quality_threshold)
+
+        return limits
 
 
 # =============================================================================
@@ -1664,23 +2021,20 @@ class SynchronizationHelper:
         Improved auto-dekinking using StatisticsPen for curve shape preservation.
 
         This method uses statistical properties of curves (area, variance, correlation, slant)
-        to find the optimal dekinking solution that minimizes total curve change.
-
-        Key principles:
-        1. Minimize TOTAL curvature change across ALL masters
-        2. Prioritize corner masters (design space extremes)
-        3. Prefer moving off-curve handles over on-curve points
+        to find the optimal dekinking solution that preserves curve shape across masters.
 
         Strategy:
-        1. Identify corner masters for weighting
-        2. Search for the target ratio that minimizes weighted total deviation
-        3. Apply changes with high off-curve bias
-        4. Use statistics-guided compensation for opposite handles
+        1. Compute original curve statistics for all affected segments
+        2. Determine cross-master curve similarity (to decide aggressiveness)
+        3. Find optimal target ratio considering curve preservation
+        4. Apply dekinking with statistics-guided handle compensation
 
         Args:
             selected_nodes_info: List of (node, path, path_idx, node_idx)
             font: The GSFont
             quality_threshold: Minimum curve quality to preserve (0.0-1.0)
+                              Higher = more curve preservation, less dekinking
+                              Lower = more dekinking, may change curves more
 
         Returns:
             Number of nodes processed
@@ -1695,9 +2049,6 @@ class SynchronizationHelper:
         glyph = current_layer.parent
         if not glyph:
             return 0
-
-        # Identify corner masters upfront
-        corner_masters = CurveStatisticsHelper.identify_corner_masters(font)
 
         processed_count = 0
 
@@ -1728,11 +2079,6 @@ class SynchronizationHelper:
                         )
                     )
 
-                    # Compute master weight
-                    weight = CurveStatisticsHelper.compute_master_weight(
-                        master, font, corner_masters
-                    )
-
                     master_data.append(
                         {
                             "master": master,
@@ -1741,8 +2087,6 @@ class SynchronizationHelper:
                             "node": corresponding,
                             "ratio": current_ratio,
                             "original_stats": original_stats,
-                            "weight": weight,
-                            "is_corner": master.id in corner_masters,
                         }
                     )
                 except Exception:
@@ -1757,34 +2101,97 @@ class SynchronizationHelper:
             if ratio_spread < 0.01:
                 continue
 
-            # Find optimal target ratio that minimizes weighted total deviation
-            # Use weighted median of corner masters if possible, else all masters
-            corner_data = [d for d in master_data if d["is_corner"]]
-            if len(corner_data) >= 2:
-                # Weighted average of corner masters (gives them priority)
-                corner_total = sum(d["ratio"] * d["weight"] for d in corner_data)
-                corner_weights = sum(d["weight"] for d in corner_data)
-                target_ratio = corner_total / corner_weights
+            dekink_log("=" * 60)
+            dekink_log(
+                f"APPLY DEKINK - Processing node at path {path_idx}, node {node_idx}"
+            )
+            dekink_log(f"Masters: {len(master_data)}, Ratio spread: {ratio_spread:.4f}")
+            for d in master_data:
+                dekink_log(f"  Master '{d['master'].name}': ratio={d['ratio']:.4f}")
+
+            # Compute cross-master curve similarity
+            node_info_list = [
+                {"node": d["node"], "path": d["path"], "master_id": d["master"].id}
+                for d in master_data
+            ]
+            cross_master_similarity = (
+                CurveStatisticsHelper.compute_cross_master_similarity(node_info_list)
+            )
+            dekink_log(f"Cross-master similarity: {cross_master_similarity:.4f}")
+
+            # Build original stats by master for weighting calculation
+            original_stats_by_master = {
+                d["master"].id: d["original_stats"] for d in master_data
+            }
+
+            # Compute per-master weights based on designspace position, kink region, and distortion
+            master_weights = CurveStatisticsHelper.compute_master_weights(
+                master_data, font, original_stats_by_master
+            )
+            dekink_log(f"Master weights:")
+            for d in master_data:
+                w = master_weights.get(d["master"].id, 0)
+                dekink_log(f"  Master '{d['master'].name}': weight={w:.4f}")
+
+            # Target ratio is weighted average - prioritizes corner masters
+            target_ratio = CurveStatisticsHelper.compute_weighted_target_ratio(
+                master_data, master_weights
+            )
+            simple_avg = sum(d["ratio"] for d in master_data) / len(master_data)
+            dekink_log(
+                f"Target ratio: {target_ratio:.4f} (simple avg would be {simple_avg:.4f})"
+            )
+
+            # Compute per-master blend limits
+            blend_limits = CurveStatisticsHelper.compute_per_master_blend_limits(
+                master_data, master_weights, font, quality_threshold
+            )
+            dekink_log(f"Blend limits:")
+            for d in master_data:
+                max_b, adj_t = blend_limits.get(
+                    d["master"].id, (1.0, quality_threshold)
+                )
+                dekink_log(
+                    f"  Master '{d['master'].name}': max_blend={max_b:.3f}, adj_threshold={adj_t:.3f}"
+                )
+
+            # Adjust base quality threshold based on cross-master similarity
+            # If curves are already very similar across masters, we can be more aggressive
+            if cross_master_similarity > 0.95:
+                base_threshold_factor = 0.7  # More aggressive
+            elif cross_master_similarity > 0.85:
+                base_threshold_factor = 0.85
             else:
-                # Weighted average of all masters
-                total_weighted = sum(d["ratio"] * d["weight"] for d in master_data)
-                total_weights = sum(d["weight"] for d in master_data)
-                target_ratio = total_weighted / total_weights
+                base_threshold_factor = 1.0  # Stay cautious
 
-            # Clamp target to reasonable range (between min and max ratios)
-            target_ratio = max(min(ratios), min(target_ratio, max(ratios)))
-
-            # High off-curve preference: Move handles 4x more than on-curve points
-            # This preserves on-curve positions better
-            off_curve_change = 0.8
-
-            # Process each master - find optimal blend per master
+            # Process each master with its specific limits
             for data in master_data:
+                master = data["master"]
                 master_layer = data["layer"]
                 master_path = data["path"]
                 corresponding = data["node"]
                 original_stats = data["original_stats"]
-                master_weight = data["weight"]
+
+                dekink_log(f"\n  --- Processing Master '{master.name}' ---")
+
+                # Log original positions
+                orig_node_pos = (corresponding.position.x, corresponding.position.y)
+                dekink_log(
+                    f"  Original node position: ({orig_node_pos[0]:.1f}, {orig_node_pos[1]:.1f})"
+                )
+                dekink_log(f"  Original ratio: {data['ratio']:.4f}")
+
+                # Get this master's specific limits
+                master_id = master.id
+                max_blend, adjusted_threshold = blend_limits.get(
+                    master_id, (1.0, quality_threshold)
+                )
+
+                # Apply cross-master similarity factor to threshold
+                effective_threshold = adjusted_threshold * base_threshold_factor
+                dekink_log(
+                    f"  Effective threshold: {effective_threshold:.3f} (base {quality_threshold:.3f} * factor {base_threshold_factor:.2f})"
+                )
 
                 nodes = list(master_path.nodes)
                 num_nodes = len(nodes)
@@ -1792,20 +2199,32 @@ class SynchronizationHelper:
                 prev_node = nodes[(corr_idx - 1) % num_nodes]
                 next_node = nodes[(corr_idx + 1) % num_nodes]
 
-                # Adaptive threshold based on master importance
-                # Corner masters need higher quality preservation
-                if data["is_corner"]:
-                    effective_threshold = min(0.98, quality_threshold + 0.1)
+                # Log handle positions
+                if prev_node.type == GSOFFCURVE:
+                    dekink_log(
+                        f"  Prev handle (OFFCURVE): ({prev_node.position.x:.1f}, {prev_node.position.y:.1f})"
+                    )
                 else:
-                    effective_threshold = quality_threshold
+                    dekink_log(
+                        f"  Prev node (ONCURVE): ({prev_node.position.x:.1f}, {prev_node.position.y:.1f})"
+                    )
+                if next_node.type == GSOFFCURVE:
+                    dekink_log(
+                        f"  Next handle (OFFCURVE): ({next_node.position.x:.1f}, {next_node.position.y:.1f})"
+                    )
+                else:
+                    dekink_log(
+                        f"  Next node (ONCURVE): ({next_node.position.x:.1f}, {next_node.position.y:.1f})"
+                    )
 
                 # Binary search for optimal blend that meets quality threshold
-                low_blend, high_blend = 0.0, 1.0
+                # Respect this master's max blend limit
+                low_blend, high_blend = 0.0, max_blend
                 best_blend = 0.0
                 best_quality = 1.0
-                best_positions = None
 
-                for _ in range(15):  # Binary search iterations
+                dekink_log(f"  Binary search: max_blend={max_blend:.3f}")
+                for iteration in range(15):  # Binary search iterations
                     mid_blend = (low_blend + high_blend) / 2
 
                     # Calculate positions for this blend
@@ -1814,7 +2233,7 @@ class SynchronizationHelper:
                         master_path,
                         target_ratio,
                         mid_blend,
-                        off_curve_change=off_curve_change,
+                        off_curve_change=0.5,
                     )
 
                     # Compute statistics for modified curves
@@ -1841,91 +2260,214 @@ class SynchronizationHelper:
                         original_stats, modified_stats
                     )
 
+                    if (
+                        iteration < 3 or iteration == 14
+                    ):  # Log first few and last iteration
+                        dekink_log(
+                            f"    iter {iteration}: blend={mid_blend:.4f}, quality={quality:.4f}"
+                        )
+
                     if quality >= effective_threshold:
                         # Quality acceptable, try higher blend
                         best_blend = mid_blend
                         best_quality = quality
-                        best_positions = positions
                         low_blend = mid_blend
                     else:
                         # Quality too low, reduce blend
                         high_blend = mid_blend
 
+                dekink_log(
+                    f"  Binary search result: best_blend={best_blend:.4f}, best_quality={best_quality:.4f}"
+                )
+
                 if best_blend < 0.01:
+                    dekink_log(f"  SKIPPING - blend too small")
                     continue
 
-                if best_positions is None:
-                    continue
+                # IMPORTANT: Capture segment info BEFORE moving anything
+                # This ensures we use original geometry for compensation calculations
+                seg_info_prev = CurveStatisticsHelper.get_curve_segment_from_node(
+                    corresponding, master_path, "prev"
+                )
+                seg_info_next = CurveStatisticsHelper.get_curve_segment_from_node(
+                    corresponding, master_path, "next"
+                )
 
                 # Apply the best blend
+                positions = SynchronizationHelper.calculate_positions_for_blend(
+                    corresponding,
+                    master_path,
+                    target_ratio,
+                    best_blend,
+                    off_curve_change=0.5,
+                )
+
+                # Move the node and its handles
                 corresponding.position = NSPoint(
-                    round(best_positions["node_pos"][0]),
-                    round(best_positions["node_pos"][1]),
+                    round(positions["node_pos"][0]), round(positions["node_pos"][1])
                 )
 
                 if prev_node.type == GSOFFCURVE:
                     prev_node.position = NSPoint(
-                        round(best_positions["prev_pos"][0]),
-                        round(best_positions["prev_pos"][1]),
+                        round(positions["prev_pos"][0]), round(positions["prev_pos"][1])
                     )
 
                 if next_node.type == GSOFFCURVE:
                     next_node.position = NSPoint(
-                        round(best_positions["next_pos"][0]),
-                        round(best_positions["next_pos"][1]),
+                        round(positions["next_pos"][0]), round(positions["next_pos"][1])
+                    )
+
+                # Log positions after main move
+                dekink_log(f"  After main move:")
+                dekink_log(
+                    f"    Node: ({corresponding.position.x:.1f}, {corresponding.position.y:.1f})"
+                )
+                if prev_node.type == GSOFFCURVE:
+                    dekink_log(
+                        f"    Prev handle: ({prev_node.position.x:.1f}, {prev_node.position.y:.1f})"
+                    )
+                if next_node.type == GSOFFCURVE:
+                    dekink_log(
+                        f"    Next handle: ({next_node.position.x:.1f}, {next_node.position.y:.1f})"
                     )
 
                 # Apply statistics-guided compensation to opposite handles
+                # Use the PRE-CAPTURED segment info (before we moved anything)
+                dekink_log(f"  Opposite handle compensation:")
                 for direction in ["prev", "next"]:
-                    seg_info = CurveStatisticsHelper.get_curve_segment_from_node(
-                        corresponding, master_path, direction
-                    )
+                    # Use pre-captured segment info
+                    seg_info = seg_info_prev if direction == "prev" else seg_info_next
 
                     if seg_info is None or not seg_info["is_curve"]:
+                        dekink_log(f"    {direction}: no curve segment, skipping")
                         continue
 
                     opp_handle = seg_info.get("opp_handle_node")
                     if opp_handle is None:
+                        dekink_log(f"    {direction}: no opposite handle, skipping")
                         continue
+
+                    dekink_log(f"    {direction} segment (ORIGINAL geometry):")
+                    dekink_log(f"      p0={seg_info['p0']}, p1={seg_info['p1']}")
+                    dekink_log(f"      p2={seg_info['p2']}, p3={seg_info['p3']}")
+                    dekink_log(
+                        f"      opp_handle current: ({opp_handle.position.x:.1f}, {opp_handle.position.y:.1f})"
+                    )
 
                     # Get original stats for this segment
                     orig_seg_stats = original_stats.get(direction)
                     if orig_seg_stats is None or orig_seg_stats.get("stats") is None:
+                        dekink_log(f"      no original stats, skipping")
                         continue
 
                     target_stats = orig_seg_stats["stats"]
-
-                    # Determine which handle position changed
-                    if direction == "prev":
-                        new_handle_pos = (prev_node.position.x, prev_node.position.y)
-                    else:
-                        new_handle_pos = (next_node.position.x, next_node.position.y)
-
-                    # Find optimal compensation scale
-                    best_scale, _ = CurveStatisticsHelper.find_optimal_compensation(
-                        seg_info, target_stats, new_handle_pos, direction == "prev"
+                    dekink_log(
+                        f"      target stats: area={target_stats.get('area', 'N/A'):.1f}, meanX={target_stats.get('meanX', 'N/A'):.1f}, meanY={target_stats.get('meanY', 'N/A'):.1f}"
                     )
 
-                    # Apply compensation
+                    # Get the NEW positions for node and near-handle (already moved)
+                    new_node_pos = positions[
+                        "node_pos"
+                    ]  # Use computed position (not rounded)
                     if direction == "prev":
-                        anchor = seg_info["p0"]
+                        new_handle_pos = positions["prev_pos"]
                     else:
-                        anchor = seg_info["p3"]
+                        new_handle_pos = positions["next_pos"]
 
+                    dekink_log(
+                        f"      new_node_pos={new_node_pos}, new_handle_pos={new_handle_pos}"
+                    )
+
+                    # Find optimal compensation using BOTH opposite handle AND anchor point
+                    # Returns (handle_scale, anchor_offset, similarity)
+                    best_scale, anchor_offset, best_sim = (
+                        CurveStatisticsHelper.find_optimal_compensation(
+                            seg_info,
+                            target_stats,
+                            new_handle_pos,
+                            new_node_pos,
+                            direction == "prev",
+                        )
+                    )
+                    dekink_log(
+                        f"      compensation: scale={best_scale:.3f}, anchor_offset=({anchor_offset[0]:.1f}, {anchor_offset[1]:.1f}), similarity={best_sim:.3f}"
+                    )
+
+                    # Get anchor node reference and original position
+                    anchor_node = seg_info.get("opp_oncurve_node")
+                    if direction == "prev":
+                        anchor_orig = seg_info["p0"]
+                    else:
+                        anchor_orig = seg_info["p3"]
+
+                    # Apply anchor offset first (move the far on-curve point)
+                    if anchor_node is not None and (
+                        abs(anchor_offset[0]) > 0.1 or abs(anchor_offset[1]) > 0.1
+                    ):
+                        new_anchor_pos = (
+                            anchor_orig[0] + anchor_offset[0],
+                            anchor_orig[1] + anchor_offset[1],
+                        )
+                        dekink_log(
+                            f"      MOVING anchor from {anchor_orig} to ({new_anchor_pos[0]:.1f}, {new_anchor_pos[1]:.1f})"
+                        )
+                        anchor_node.position = NSPoint(
+                            round(new_anchor_pos[0]), round(new_anchor_pos[1])
+                        )
+                        # Update anchor for handle calculation
+                        anchor = new_anchor_pos
+                    else:
+                        anchor = anchor_orig
+
+                    # Apply handle scale (relative to potentially moved anchor)
                     opp_pos = (opp_handle.position.x, opp_handle.position.y)
-                    handle_dir = (opp_pos[0] - anchor[0], opp_pos[1] - anchor[1])
+                    # Use original handle direction, but from new anchor position
+                    if direction == "prev":
+                        orig_handle_dir = (
+                            seg_info["p1"][0] - seg_info["p0"][0],
+                            seg_info["p1"][1] - seg_info["p0"][1],
+                        )
+                    else:
+                        orig_handle_dir = (
+                            seg_info["p2"][0] - seg_info["p3"][0],
+                            seg_info["p2"][1] - seg_info["p3"][1],
+                        )
 
-                    if abs(handle_dir[0]) > 0.1 or abs(handle_dir[1]) > 0.1:
+                    dekink_log(
+                        f"      anchor={anchor}, orig_handle_dir=({orig_handle_dir[0]:.1f}, {orig_handle_dir[1]:.1f})"
+                    )
+
+                    if abs(orig_handle_dir[0]) > 0.1 or abs(orig_handle_dir[1]) > 0.1:
                         new_opp_pos = (
-                            anchor[0] + handle_dir[0] * best_scale,
-                            anchor[1] + handle_dir[1] * best_scale,
+                            anchor[0] + orig_handle_dir[0] * best_scale,
+                            anchor[1] + orig_handle_dir[1] * best_scale,
+                        )
+                        dekink_log(
+                            f"      MOVING opp_handle to: ({new_opp_pos[0]:.1f}, {new_opp_pos[1]:.1f})"
                         )
                         opp_handle.position = NSPoint(
                             round(new_opp_pos[0]), round(new_opp_pos[1])
                         )
+                    else:
+                        dekink_log(f"      handle_dir too small, not moving")
+
+                # Final positions for this master
+                dekink_log(f"  FINAL positions for Master '{master.name}':")
+                dekink_log(
+                    f"    Node: ({corresponding.position.x:.1f}, {corresponding.position.y:.1f})"
+                )
+                if prev_node.type == GSOFFCURVE:
+                    dekink_log(
+                        f"    Prev handle: ({prev_node.position.x:.1f}, {prev_node.position.y:.1f})"
+                    )
+                if next_node.type == GSOFFCURVE:
+                    dekink_log(
+                        f"    Next handle: ({next_node.position.x:.1f}, {next_node.position.y:.1f})"
+                    )
 
             processed_count += 1
 
+        dekink_log("=" * 60)
         return processed_count
 
     @staticmethod
@@ -1936,10 +2478,6 @@ class SynchronizationHelper:
         Calculate preview points for statistics-based auto mode.
 
         Returns preview positions without modifying the actual glyph.
-        Uses the same improved algorithm as sync_ratios_auto_statistics:
-        - Prioritizes corner masters
-        - Minimizes total curvature change
-        - Prefers off-curve movement
         """
         if not selected_nodes_info or not font:
             return None
@@ -1951,9 +2489,6 @@ class SynchronizationHelper:
         glyph = current_layer.parent
         if not glyph:
             return None
-
-        # Identify corner masters
-        corner_masters = CurveStatisticsHelper.identify_corner_masters(font)
 
         # Extract current glyph points for all masters
         preview_points = {}
@@ -1998,21 +2533,14 @@ class SynchronizationHelper:
                         )
                     )
 
-                    weight = CurveStatisticsHelper.compute_master_weight(
-                        master, font, corner_masters
-                    )
-                    is_corner = master.id in corner_masters
-
                     master_data.append(
                         {
-                            "master_idx": master_idx,
                             "master": master,
+                            "master_idx": master_idx,
                             "path": master_path,
                             "node": corresponding,
                             "ratio": current_ratio,
                             "original_stats": original_stats,
-                            "weight": weight,
-                            "is_corner": is_corner,
                         }
                     )
                 except Exception:
@@ -2025,28 +2553,89 @@ class SynchronizationHelper:
             if max(ratios) - min(ratios) < 0.01:
                 continue
 
-            # Find optimal target ratio - prioritize corner masters
-            corner_data = [d for d in master_data if d["is_corner"]]
-            if len(corner_data) >= 2:
-                corner_total = sum(d["ratio"] * d["weight"] for d in corner_data)
-                corner_weights = sum(d["weight"] for d in corner_data)
-                target_ratio = corner_total / corner_weights
+            dekink_log("=" * 60)
+            dekink_log(f"PREVIEW - Processing node at path {path_idx}, node {node_idx}")
+            dekink_log(
+                f"Masters: {len(master_data)}, Ratio spread: {max(ratios) - min(ratios):.4f}"
+            )
+            for d in master_data:
+                dekink_log(f"  Master '{d['master'].name}': ratio={d['ratio']:.4f}")
+
+            # Cross-master similarity
+            node_info_list = [
+                {"node": d["node"], "path": d["path"], "master_id": d["master"].id}
+                for d in master_data
+            ]
+            cross_master_similarity = (
+                CurveStatisticsHelper.compute_cross_master_similarity(node_info_list)
+            )
+            dekink_log(f"Cross-master similarity: {cross_master_similarity:.4f}")
+
+            # Build original stats by master for weighting calculation
+            original_stats_by_master = {
+                d["master"].id: d["original_stats"] for d in master_data
+            }
+
+            # Compute per-master weights based on designspace position, kink region, and distortion
+            master_weights = CurveStatisticsHelper.compute_master_weights(
+                master_data, font, original_stats_by_master
+            )
+            dekink_log(f"Master weights (PREVIEW):")
+            for d in master_data:
+                w = master_weights.get(d["master"].id, 0)
+                dekink_log(f"  Master '{d['master'].name}': weight={w:.4f}")
+
+            # Target ratio is weighted average - prioritizes corner masters
+            target_ratio = CurveStatisticsHelper.compute_weighted_target_ratio(
+                master_data, master_weights
+            )
+            simple_avg = sum(d["ratio"] for d in master_data) / len(master_data)
+            dekink_log(
+                f"Target ratio (PREVIEW): {target_ratio:.4f} (simple avg would be {simple_avg:.4f})"
+            )
+
+            # Compute per-master blend limits
+            blend_limits = CurveStatisticsHelper.compute_per_master_blend_limits(
+                master_data, master_weights, font, quality_threshold
+            )
+            dekink_log(f"Blend limits (PREVIEW):")
+            for d in master_data:
+                max_b, adj_t = blend_limits.get(
+                    d["master"].id, (1.0, quality_threshold)
+                )
+                dekink_log(
+                    f"  Master '{d['master'].name}': max_blend={max_b:.3f}, adj_threshold={adj_t:.3f}"
+                )
+
+            # Adjust base quality threshold based on cross-master similarity
+            if cross_master_similarity > 0.95:
+                base_threshold_factor = 0.7
+            elif cross_master_similarity > 0.85:
+                base_threshold_factor = 0.85
             else:
-                total_weighted = sum(d["ratio"] * d["weight"] for d in master_data)
-                total_weights = sum(d["weight"] for d in master_data)
-                target_ratio = total_weighted / total_weights
-
-            # Clamp target ratio
-            target_ratio = max(min(ratios), min(target_ratio, max(ratios)))
-
-            # High off-curve preference
-            off_curve_change = 0.8
+                base_threshold_factor = 1.0
 
             for data in master_data:
+                master = data["master"]
                 master_idx = data["master_idx"]
                 master_path = data["path"]
                 corresponding = data["node"]
                 original_stats = data["original_stats"]
+
+                dekink_log(f"\n  --- PREVIEW Processing Master '{master.name}' ---")
+                orig_node_pos = (corresponding.position.x, corresponding.position.y)
+                dekink_log(
+                    f"  Original node position: ({orig_node_pos[0]:.1f}, {orig_node_pos[1]:.1f})"
+                )
+
+                # Get this master's specific limits
+                master_id = master.id
+                max_blend, adjusted_threshold = blend_limits.get(
+                    master_id, (1.0, quality_threshold)
+                )
+
+                # Apply cross-master similarity factor to threshold
+                effective_threshold = adjusted_threshold * base_threshold_factor
 
                 nodes = list(master_path.nodes)
                 num_nodes = len(nodes)
@@ -2054,18 +2643,15 @@ class SynchronizationHelper:
                 prev_node = nodes[(corr_idx - 1) % num_nodes]
                 next_node = nodes[(corr_idx + 1) % num_nodes]
 
-                # Adaptive threshold for corner masters
-                if data["is_corner"]:
-                    effective_threshold = min(0.98, quality_threshold + 0.1)
-                else:
-                    effective_threshold = quality_threshold
+                dekink_log(
+                    f"  PREVIEW Binary search: max_blend={max_blend:.3f}, eff_threshold={effective_threshold:.3f}"
+                )
 
-                # Binary search for best blend
-                low_blend, high_blend = 0.0, 1.0
+                # Binary search for best blend, respecting this master's max blend limit
+                low_blend, high_blend = 0.0, max_blend
                 best_blend = 0.0
-                best_positions = None
 
-                for _ in range(15):
+                for iteration in range(15):
                     mid_blend = (low_blend + high_blend) / 2
 
                     positions = SynchronizationHelper.calculate_positions_for_blend(
@@ -2073,7 +2659,7 @@ class SynchronizationHelper:
                         master_path,
                         target_ratio,
                         mid_blend,
-                        off_curve_change=off_curve_change,
+                        off_curve_change=0.5,
                     )
 
                     modified_stats = (
@@ -2098,15 +2684,43 @@ class SynchronizationHelper:
                         original_stats, modified_stats
                     )
 
+                    if iteration < 3 or iteration == 14:  # Log first few and last
+                        dekink_log(
+                            f"    PREVIEW iter {iteration}: blend={mid_blend:.4f}, quality={quality:.4f}"
+                        )
+
                     if quality >= effective_threshold:
                         best_blend = mid_blend
-                        best_positions = positions
                         low_blend = mid_blend
                     else:
                         high_blend = mid_blend
 
-                if best_blend < 0.01 or best_positions is None:
+                dekink_log(
+                    f"  PREVIEW Binary search result: best_blend={best_blend:.4f}"
+                )
+
+                if best_blend < 0.01:
+                    dekink_log(f"  PREVIEW SKIPPING - blend too small")
                     continue
+
+                positions = SynchronizationHelper.calculate_positions_for_blend(
+                    corresponding,
+                    master_path,
+                    target_ratio,
+                    best_blend,
+                    off_curve_change=0.5,
+                )
+
+                dekink_log(f"  PREVIEW positions for Master '{master.name}':")
+                dekink_log(
+                    f"    Node: ({positions['node_pos'][0]:.1f}, {positions['node_pos'][1]:.1f})"
+                )
+                dekink_log(
+                    f"    Prev: ({positions['prev_pos'][0]:.1f}, {positions['prev_pos'][1]:.1f})"
+                )
+                dekink_log(
+                    f"    Next: ({positions['next_pos'][0]:.1f}, {positions['next_pos'][1]:.1f})"
+                )
 
                 # Update preview points
                 node_flat_idx = node_to_point.get((path_idx, node_idx))
@@ -2119,22 +2733,22 @@ class SynchronizationHelper:
                     preview_points[master_idx]
                 ):
                     preview_points[master_idx][node_flat_idx] = (
-                        round(best_positions["node_pos"][0]),
-                        round(best_positions["node_pos"][1]),
+                        round(positions["node_pos"][0]),
+                        round(positions["node_pos"][1]),
                     )
 
                 if prev_node.type == GSOFFCURVE and prev_flat_idx is not None:
                     if prev_flat_idx < len(preview_points[master_idx]):
                         preview_points[master_idx][prev_flat_idx] = (
-                            round(best_positions["prev_pos"][0]),
-                            round(best_positions["prev_pos"][1]),
+                            round(positions["prev_pos"][0]),
+                            round(positions["prev_pos"][1]),
                         )
 
                 if next_node.type == GSOFFCURVE and next_flat_idx is not None:
                     if next_flat_idx < len(preview_points[master_idx]):
                         preview_points[master_idx][next_flat_idx] = (
-                            round(best_positions["next_pos"][0]),
-                            round(best_positions["next_pos"][1]),
+                            round(positions["next_pos"][0]),
+                            round(positions["next_pos"][1]),
                         )
 
                 # Also preview compensation on opposite handles
@@ -2156,24 +2770,69 @@ class SynchronizationHelper:
 
                     target_stats = orig_seg_stats["stats"]
 
+                    # Get new positions for node and near-handle
+                    new_node_pos = positions["node_pos"]
                     if direction == "prev":
-                        new_handle_pos = best_positions["prev_pos"]
-                        anchor = seg_info["p0"]
+                        new_handle_pos = positions["prev_pos"]
+                        anchor_orig = seg_info["p0"]
                     else:
-                        new_handle_pos = best_positions["next_pos"]
-                        anchor = seg_info["p3"]
+                        new_handle_pos = positions["next_pos"]
+                        anchor_orig = seg_info["p3"]
 
-                    best_scale, _ = CurveStatisticsHelper.find_optimal_compensation(
-                        seg_info, target_stats, new_handle_pos, direction == "prev"
+                    # Get compensation (handle scale + anchor offset)
+                    best_scale, anchor_offset, _ = (
+                        CurveStatisticsHelper.find_optimal_compensation(
+                            seg_info,
+                            target_stats,
+                            new_handle_pos,
+                            new_node_pos,
+                            direction == "prev",
+                        )
                     )
 
-                    opp_pos = (opp_handle.position.x, opp_handle.position.y)
-                    handle_dir = (opp_pos[0] - anchor[0], opp_pos[1] - anchor[1])
+                    # Apply anchor offset to preview
+                    anchor_node = seg_info.get("opp_oncurve_node")
+                    if anchor_node is not None and (
+                        abs(anchor_offset[0]) > 0.1 or abs(anchor_offset[1]) > 0.1
+                    ):
+                        new_anchor_pos = (
+                            anchor_orig[0] + anchor_offset[0],
+                            anchor_orig[1] + anchor_offset[1],
+                        )
+                        anchor_idx = nodes.index(anchor_node)
+                        anchor_flat_idx = node_to_point.get((path_idx, anchor_idx))
 
-                    if abs(handle_dir[0]) > 0.1 or abs(handle_dir[1]) > 0.1:
+                        if anchor_flat_idx is not None and anchor_flat_idx < len(
+                            preview_points[master_idx]
+                        ):
+                            preview_points[master_idx][anchor_flat_idx] = (
+                                round(new_anchor_pos[0]),
+                                round(new_anchor_pos[1]),
+                            )
+                        anchor = new_anchor_pos
+                    else:
+                        anchor = anchor_orig
+
+                    # Apply handle scale
+                    opp_pos = (opp_handle.position.x, opp_handle.position.y)
+                    if direction == "prev":
+                        orig_handle_dir = (
+                            seg_info["p1"][0] - seg_info["p0"][0],
+                            seg_info["p1"][1] - seg_info["p0"][1],
+                        )
+                    else:
+                        orig_handle_dir = (
+                            seg_info["p2"][0] - seg_info["p3"][0],
+                            seg_info["p2"][1] - seg_info["p3"][1],
+                        )
+
+                    if abs(orig_handle_dir[0]) > 0.1 or abs(orig_handle_dir[1]) > 0.1:
                         new_opp_pos = (
-                            anchor[0] + handle_dir[0] * best_scale,
-                            anchor[1] + handle_dir[1] * best_scale,
+                            anchor[0] + orig_handle_dir[0] * best_scale,
+                            anchor[1] + orig_handle_dir[1] * best_scale,
+                        )
+                        dekink_log(
+                            f"  PREVIEW opp_handle compensation ({direction}): scale={best_scale:.3f}, anchor_offset=({anchor_offset[0]:.1f}, {anchor_offset[1]:.1f}), new_pos=({new_opp_pos[0]:.1f}, {new_opp_pos[1]:.1f})"
                         )
 
                         opp_handle_idx = nodes.index(opp_handle)
@@ -2186,6 +2845,10 @@ class SynchronizationHelper:
                                 round(new_opp_pos[0]),
                                 round(new_opp_pos[1]),
                             )
+
+        dekink_log("=" * 60)
+        dekink_log("END PREVIEW")
+        dekink_log("=" * 60)
 
         # Convert to GlyphCoordinates
         result = {}
