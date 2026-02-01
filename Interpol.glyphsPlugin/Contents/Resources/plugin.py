@@ -5930,80 +5930,6 @@ class GlyphInterpolator:
         return glyph_points, widths, decomposed_layers[0]
 
     @staticmethod
-    def extract_source_data(
-        glyph: Any,
-        font: Any,
-        location: Dict[str, float],
-        axis_min_max: Dict[str, Tuple[float, float]],
-        include_intermediates: bool = True,
-        include_alternates: bool = True,
-    ) -> Tuple[
-        Optional[Dict[int, Any]],
-        Optional[List[float]],
-        Optional[Any],
-        Optional[List[Dict[str, float]]],
-    ]:
-        """
-        Extract point data and widths from all interpolation sources for a glyph.
-
-        This is an enhanced version of extract_master_data that includes:
-        - Intermediate layers (for finer interpolation control)
-        - Alternate layers (when current location falls within their scope)
-
-        Args:
-            glyph: A GSGlyph
-            font: The GSFont containing the glyph
-            location: Current interpolation location (normalized 0-1 per axis)
-            axis_min_max: Dict mapping axis tags to (min, max) design space values
-            include_intermediates: Whether to include intermediate (brace) layers
-            include_alternates: Whether to include alternate (bracket) layers
-
-        Returns:
-            tuple: (glyph_points_dict, widths_list, reference_layer, source_locations)
-                   or (None, None, None, None) on failure
-        """
-        if not glyph or not font or not font.masters:
-            return None, None, None, None
-
-        # Use SpecialLayerHelper to collect all relevant layers
-        source_layers, source_locations, _uses_special = (
-            SpecialLayerHelper.collect_interpolation_sources(
-                glyph,
-                font,
-                location,
-                axis_min_max,
-                include_intermediates=include_intermediates,
-                include_alternates=include_alternates,
-            )
-        )
-
-        if not source_layers:
-            return None, None, None, None
-
-        # Decompose layers and extract points
-        decomposed_layers = []
-        for layer in source_layers:
-            decomposed_layers.append(GlyphInterpolator.get_decomposed_layer(layer))
-
-        # Extract points from each decomposed layer
-        glyph_points = {}
-        widths = []
-
-        for ix, decomposed in enumerate(decomposed_layers):
-            glyph_points[ix] = GlyphInterpolator.extract_points_from_layer(decomposed)
-            widths.append(source_layers[ix].width)
-
-        # Validate compatibility
-        if not GlyphInterpolator.validate_points_compatibility(glyph_points):
-            # Fall back to master-only extraction if sources are incompatible
-            debug_log(
-                f"extract_source_data: incompatible sources, falling back to masters only"
-            )
-            return GlyphInterpolator.extract_master_data(glyph, font) + (None,)
-
-        return glyph_points, widths, decomposed_layers[0], source_locations
-
-    @staticmethod
     def validate_points_compatibility(glyph_points: Dict[int, Any]) -> bool:
         """
         Check if all master point arrays have the same length (compatible for interpolation).
@@ -6250,726 +6176,206 @@ class GlyphInterpolator:
 
 
 class SpecialLayerHelper:
-    """
-    Helper class for working with special layers in Glyphs:
-
-    - Intermediate Layers: Provide additional control points in the designspace
-      for fine-tuning interpolation at specific positions. They have a
-      'coordinates' attribute specifying their exact designspace position.
-
-    - Alternate Layers: Provide completely different glyph shapes that switch in
-      at certain axis thresholds. They have 'axisRules' attribute defining
-      min/max bounds on each axis where they should be active.
-    """
+    """Minimal helper for intermediate (brace) and alternate (bracket) layers."""
 
     @staticmethod
-    def is_intermediate_layer(layer) -> bool:
-        """
-        Check if a layer is an intermediate layer (brace layer).
-
-        Intermediate layers have coordinates attribute and are not master layers.
-        In Glyphs 3, they are identified by having 'coordinates' in attributes.
-        """
-        try:
-            # First check if it's a master layer - masters are not intermediate
-            if hasattr(layer, "isMasterLayer") and layer.isMasterLayer:
-                return False
-
-            # Check for coordinates attribute (the defining feature of intermediate layers)
-            if hasattr(layer, "attributes") and layer.attributes:
-                coords = layer.attributes.get("coordinates")
-                if coords is not None:
-                    # Handle both Python types and Objective-C types (NSDictionary, NSArray)
-                    # Use try/except with len() since ObjC objects support len() but may not pass isinstance()
-                    try:
-                        if len(coords) > 0:
-                            return True
-                    except TypeError:
-                        # Single value that doesn't support len()
-                        if coords:
-                            return True
-            return False
-        except Exception as e:
-            debug_log(f"is_intermediate_layer error: {e}")
-            return False
-
-    @staticmethod
-    def is_alternate_layer(layer) -> bool:
-        """
-        Check if a layer is an alternate layer (bracket layer).
-
-        Alternate layers have axisRules attribute defining their activation scope.
-        In Glyphs 3, they are identified by having 'axisRules' in attributes.
-        """
-        try:
-            # First check if it's a master layer - masters are not alternate
-            if hasattr(layer, "isMasterLayer") and layer.isMasterLayer:
-                return False
-
-            # Check for axisRules attribute (the defining feature of alternate layers)
-            if hasattr(layer, "attributes") and layer.attributes:
-                rules = layer.attributes.get("axisRules")
-                if rules is not None:
-                    # Handle both Python types and Objective-C types (NSDictionary, NSArray)
-                    # Use try/except with len() since ObjC objects support len() but may not pass isinstance()
-                    try:
-                        if len(rules) > 0:
-                            return True
-                    except TypeError:
-                        pass
-            return False
-        except Exception as e:
-            debug_log(f"is_alternate_layer error: {e}")
-            return False
-
-    @staticmethod
-    def is_master_layer(layer) -> bool:
-        """
-        Check if a layer is a master layer (not a special layer).
-        """
-        try:
-            if hasattr(layer, "isMasterLayer"):
-                return layer.isMasterLayer
-            # Fallback: layerId equals associatedMasterId for master layers
-            return layer.layerId == layer.associatedMasterId
-        except Exception:
-            return False
-
-    @staticmethod
-    def get_intermediate_layer_coordinates(layer, font) -> Optional[Dict[str, float]]:
-        """
-        Get the designspace coordinates of an intermediate layer.
-
-        Args:
-            layer: A GSLayer that is an intermediate layer
-            font: The GSFont containing the layer
-
-        Returns:
-            Dict mapping axis tags to coordinate values, or None if not intermediate
-        """
-        try:
-            if not SpecialLayerHelper.is_intermediate_layer(layer):
-                if DEBUG_INTERPOLATE:
-                    print(
-                        f"[Interpol] get_intermediate_layer_coordinates: layer '{layer.name}' is not intermediate"
-                    )
-                return None
-
-            coords_raw = layer.attributes.get("coordinates", {})
-            if DEBUG_INTERPOLATE:
-                print(
-                    f"[Interpol] get_intermediate_layer_coordinates: raw coords = {coords_raw}, type = {type(coords_raw)}"
-                )
-            if not coords_raw:
-                return None
-
-            result = {}
-            axes = list(font.axes)
-
-            # coordinates can be a dict keyed by axis ID or a list in axis order
-            # Handle both Python types and Objective-C types (NSDictionary, NSArray)
-            # Check if it's dict-like by trying to access keys()
-            is_dict_like = hasattr(coords_raw, "keys") or hasattr(coords_raw, "allKeys")
-
-            if DEBUG_INTERPOLATE:
-                print(
-                    f"[Interpol] get_intermediate_layer_coordinates: is_dict_like={is_dict_like}"
-                )
-                if is_dict_like:
-                    try:
-                        keys = (
-                            list(coords_raw.keys())
-                            if hasattr(coords_raw, "keys")
-                            else list(coords_raw.allKeys())
-                        )
-                        print(f"[Interpol]   dict keys: {keys}")
-                    except Exception as e:
-                        print(f"[Interpol]   error getting keys: {e}")
-                for axis in axes:
-                    print(
-                        f"[Interpol]   axis: tag={axis.axisTag}, axisId={getattr(axis, 'axisId', 'N/A')}, id={getattr(axis, 'id', 'N/A')}"
-                    )
-
-            if is_dict_like:
-                # Dict format: {axisId: value}
-                # Try multiple possible key formats
-                for axis in axes:
-                    # Try axisId first, then id
-                    axis_id = getattr(axis, "axisId", None) or getattr(axis, "id", None)
-                    # Also try the raw key if present
-                    value = None
-                    if axis_id and axis_id in coords_raw:
-                        value = coords_raw[axis_id]
-                    else:
-                        # Try to find any key that might match this axis
-                        try:
-                            keys = (
-                                list(coords_raw.keys())
-                                if hasattr(coords_raw, "keys")
-                                else list(coords_raw.allKeys())
-                            )
-                            for key in keys:
-                                # If there's only one axis and one key, use it
-                                if len(axes) == 1 and len(keys) == 1:
-                                    value = coords_raw[key]
-                                    break
-                        except Exception:
-                            pass
-                    if value is not None:
-                        result[axis.axisTag] = value
-                        if DEBUG_INTERPOLATE:
-                            print(
-                                f"[Interpol]   mapped {axis_id} -> {axis.axisTag} = {value}"
-                            )
-            else:
-                # List format: values in axis order
-                try:
-                    for i, axis in enumerate(axes):
-                        if i < len(coords_raw):
-                            result[axis.axisTag] = coords_raw[i]
-                            if DEBUG_INTERPOLATE:
-                                print(
-                                    f"[Interpol]   mapped index {i} -> {axis.axisTag} = {coords_raw[i]}"
-                                )
-                except Exception as e:
-                    if DEBUG_INTERPOLATE:
-                        print(f"[Interpol]   error in list mapping: {e}")
-
-            if DEBUG_INTERPOLATE:
-                print(
-                    f"[Interpol] get_intermediate_layer_coordinates: result = {result}"
-                )
-            return result if result else None
-        except Exception as e:
-            debug_log(f"get_intermediate_layer_coordinates error: {e}")
+    def _get_layer_attr(layer, key):
+        """Get layer attribute, handling ObjC types."""
+        if not hasattr(layer, "attributes") or not layer.attributes:
             return None
-
-    @staticmethod
-    def get_alternate_layer_rules(layer, font) -> Optional[Dict[str, Dict[str, float]]]:
-        """
-        Get the axis rules defining when an alternate layer is active.
-
-        Args:
-            layer: A GSLayer that is an alternate layer
-            font: The GSFont containing the layer
-
-        Returns:
-            Dict mapping axis tags to {'min': value, 'max': value}, or None
-        """
-        try:
-            if not SpecialLayerHelper.is_alternate_layer(layer):
-                if DEBUG_INTERPOLATE:
-                    print(
-                        f"[Interpol] get_alternate_layer_rules: layer '{layer.name}' is not alternate"
-                    )
-                return None
-
-            rules_raw = layer.attributes.get("axisRules", [])
-            if DEBUG_INTERPOLATE:
-                print(
-                    f"[Interpol] get_alternate_layer_rules: raw rules = {rules_raw}, type = {type(rules_raw)}"
-                )
-            if not rules_raw:
-                return None
-
-            result = {}
-            axes = list(font.axes)
-
-            # Handle both Python types and Objective-C types (NSDictionary, NSArray)
-            is_dict_like = hasattr(rules_raw, "keys") or hasattr(rules_raw, "allKeys")
-
-            if DEBUG_INTERPOLATE:
-                print(
-                    f"[Interpol] get_alternate_layer_rules: is_dict_like={is_dict_like}"
-                )
-                for axis in axes:
-                    print(
-                        f"[Interpol]   axis: tag={axis.axisTag}, axisId={getattr(axis, 'axisId', 'N/A')}, id={getattr(axis, 'id', 'N/A')}"
-                    )
-
-            if is_dict_like:
-                # Dict format keyed by axis ID
-                # Try to find matching axis for each rule
-                try:
-                    keys = (
-                        list(rules_raw.keys())
-                        if hasattr(rules_raw, "keys")
-                        else list(rules_raw.allKeys())
-                    )
-                    if DEBUG_INTERPOLATE:
-                        print(f"[Interpol]   dict keys: {keys}")
-
-                    for axis in axes:
-                        axis_id = getattr(axis, "axisId", None) or getattr(
-                            axis, "id", None
-                        )
-                        rule = None
-                        if axis_id and axis_id in rules_raw:
-                            rule = rules_raw[axis_id]
-                        else:
-                            # If there's only one axis and one key, use it
-                            if len(axes) == 1 and len(keys) == 1:
-                                rule = rules_raw[keys[0]]
-
-                        if rule:
-                            rule_dict = {}
-                            # Handle both Python dict and ObjC NSDictionary
-                            if hasattr(rule, "get"):
-                                if rule.get("min") is not None:
-                                    rule_dict["min"] = rule["min"]
-                                if rule.get("max") is not None:
-                                    rule_dict["max"] = rule["max"]
-                            else:
-                                # Try direct access for ObjC objects
-                                try:
-                                    if "min" in rule:
-                                        rule_dict["min"] = rule["min"]
-                                    if "max" in rule:
-                                        rule_dict["max"] = rule["max"]
-                                except Exception:
-                                    pass
-                            if rule_dict:
-                                result[axis.axisTag] = rule_dict
-                                if DEBUG_INTERPOLATE:
-                                    print(
-                                        f"[Interpol]   mapped axis {axis.axisTag}: {rule_dict}"
-                                    )
-                except Exception as e:
-                    if DEBUG_INTERPOLATE:
-                        print(f"[Interpol]   error parsing dict rules: {e}")
-            else:
-                # List format: rules in axis order
-                try:
-                    for i, rule in enumerate(rules_raw):
-                        if i < len(axes) and rule:
-                            axis_tag = axes[i].axisTag
-                            rule_dict = {}
-                            if hasattr(rule, "get"):
-                                if rule.get("min") is not None:
-                                    rule_dict["min"] = rule["min"]
-                                if rule.get("max") is not None:
-                                    rule_dict["max"] = rule["max"]
-                            else:
-                                try:
-                                    if "min" in rule:
-                                        rule_dict["min"] = rule["min"]
-                                    if "max" in rule:
-                                        rule_dict["max"] = rule["max"]
-                                except Exception:
-                                    pass
-                            if rule_dict:
-                                result[axis_tag] = rule_dict
-                                if DEBUG_INTERPOLATE:
-                                    print(
-                                        f"[Interpol]   mapped axis {axis_tag}: {rule_dict}"
-                                    )
-                except Exception as e:
-                    if DEBUG_INTERPOLATE:
-                        print(f"[Interpol]   error parsing list rules: {e}")
-
-            if DEBUG_INTERPOLATE:
-                print(f"[Interpol] get_alternate_layer_rules: result = {result}")
-            return result if result else None
-        except Exception as e:
-            debug_log(f"get_alternate_layer_rules error: {e}")
+        val = layer.attributes.get(key)
+        if val is None:
             return None
+        try:
+            return val if len(val) > 0 else None
+        except TypeError:
+            return val if val else None
 
     @staticmethod
-    def is_location_in_alternate_scope(
-        location: Dict[str, float],
-        axis_min_max: Dict[str, Tuple[float, float]],
-        rules: Dict[str, Dict[str, float]],
-    ) -> bool:
-        """
-        Check if a designspace location falls within an alternate layer's scope.
-
-        Args:
-            location: Dict mapping axis tags to normalized values (0-1)
-            axis_min_max: Dict mapping axis tags to (min, max) design space values
-            rules: The alternate layer rules from get_alternate_layer_rules()
-
-        Returns:
-            True if the location is within all specified axis rules
-        """
-        if not rules:
-            if DEBUG_INTERPOLATE:
-                print(f"[Interpol] is_location_in_alternate_scope: No rules provided")
-            return False
-
-        if DEBUG_INTERPOLATE:
-            print(
-                f"[Interpol] is_location_in_alternate_scope: checking location={location}, rules={rules}"
+    def _parse_coords(coords_raw, font):
+        """Parse coordinates dict/list to {axisTag: value}."""
+        if not coords_raw:
+            return None
+        axes = list(font.axes)
+        result = {}
+        is_dict = hasattr(coords_raw, "keys") or hasattr(coords_raw, "allKeys")
+        if is_dict:
+            keys = (
+                list(coords_raw.keys())
+                if hasattr(coords_raw, "keys")
+                else list(coords_raw.allKeys())
             )
+            for axis in axes:
+                axis_id = getattr(axis, "axisId", None) or getattr(axis, "id", None)
+                if axis_id and axis_id in coords_raw:
+                    result[axis.axisTag] = coords_raw[axis_id]
+                elif len(axes) == 1 and len(keys) == 1:
+                    result[axis.axisTag] = coords_raw[keys[0]]
+        else:
+            for i, axis in enumerate(axes):
+                if i < len(coords_raw):
+                    result[axis.axisTag] = coords_raw[i]
+        return result if result else None
 
+    @staticmethod
+    def _parse_rules(rules_raw, font):
+        """Parse axisRules to {axisTag: {min, max}}."""
+        if not rules_raw:
+            return None
+        axes = list(font.axes)
+        result = {}
+        is_dict = hasattr(rules_raw, "keys") or hasattr(rules_raw, "allKeys")
+        if is_dict:
+            keys = (
+                list(rules_raw.keys())
+                if hasattr(rules_raw, "keys")
+                else list(rules_raw.allKeys())
+            )
+            for axis in axes:
+                axis_id = getattr(axis, "axisId", None) or getattr(axis, "id", None)
+                rule = rules_raw.get(axis_id) if axis_id else None
+                if not rule and len(axes) == 1 and len(keys) == 1:
+                    rule = rules_raw[keys[0]]
+                if rule:
+                    rd = {}
+                    if rule.get("min") is not None:
+                        rd["min"] = rule["min"]
+                    if rule.get("max") is not None:
+                        rd["max"] = rule["max"]
+                    if rd:
+                        result[axis.axisTag] = rd
+        else:
+            for i, rule in enumerate(rules_raw):
+                if i < len(axes) and rule:
+                    rd = {}
+                    if rule.get("min") is not None:
+                        rd["min"] = rule["min"]
+                    if rule.get("max") is not None:
+                        rd["max"] = rule["max"]
+                    if rd:
+                        result[axes[i].axisTag] = rd
+        return result if result else None
+
+    @staticmethod
+    def _location_matches_rules(location, axis_min_max, rules):
+        """Check if normalized location falls within alternate layer's scope."""
+        if not rules:
+            return False
         for axis_tag, rule in rules.items():
             if axis_tag not in location or axis_tag not in axis_min_max:
-                if DEBUG_INTERPOLATE:
-                    print(
-                        f"[Interpol]   axis '{axis_tag}' not in location or axis_min_max, skipping"
-                    )
                 continue
-
-            # Convert normalized location to actual design space value
-            norm_val = location[axis_tag]
-            min_val, max_val = axis_min_max[axis_tag]
-            actual_val = min_val + norm_val * (max_val - min_val)
-
-            # Check against rule bounds
-            rule_min = rule.get("min")
-            rule_max = rule.get("max")
-
-            if DEBUG_INTERPOLATE:
-                print(
-                    f"[Interpol]   axis '{axis_tag}': norm_val={norm_val}, actual_val={actual_val}, rule_min={rule_min}, rule_max={rule_max}"
-                )
-
-            if rule_min is not None and actual_val < rule_min:
-                if DEBUG_INTERPOLATE:
-                    print(
-                        f"[Interpol]   -> REJECTED: actual_val ({actual_val}) < rule_min ({rule_min})"
-                    )
+            min_v, max_v = axis_min_max[axis_tag]
+            actual = min_v + location[axis_tag] * (max_v - min_v)
+            if rule.get("min") is not None and actual < rule["min"]:
                 return False
-            if rule_max is not None and actual_val > rule_max:
-                if DEBUG_INTERPOLATE:
-                    print(
-                        f"[Interpol]   -> REJECTED: actual_val ({actual_val}) > rule_max ({rule_max})"
-                    )
+            if rule.get("max") is not None and actual > rule["max"]:
                 return False
-
-        if DEBUG_INTERPOLATE:
-            print(f"[Interpol]   -> ACCEPTED: location is in alternate scope")
         return True
 
     @staticmethod
-    def get_intermediate_layers_for_glyph(
-        glyph, font
-    ) -> List[Tuple[Any, Dict[str, float]]]:
-        """
-        Get all intermediate layers for a glyph with their coordinates.
-
-        Args:
-            glyph: A GSGlyph
-            font: The GSFont
-
-        Returns:
-            List of (layer, coordinates_dict) tuples for compatible intermediate layers
-        """
-        result = []
-        if not glyph or not font:
-            return result
-
-        # Get reference point count from first master for compatibility check
-        reference_layer = None
-        for master in font.masters:
-            layer = glyph.layers[master.id]
-            if layer:
-                reference_layer = layer
-                break
-
-        if not reference_layer:
-            return result
-
-        try:
-            ref_decomposed = reference_layer.copyDecomposedLayer()
-            ref_point_count = sum(len(path.nodes) for path in ref_decomposed.paths)
-        except Exception:
-            return result
-
-        for layer in glyph.layers:
-            is_intermediate = SpecialLayerHelper.is_intermediate_layer(layer)
-            if DEBUG_INTERPOLATE:
-                attrs = (
-                    dict(layer.attributes)
-                    if hasattr(layer, "attributes") and layer.attributes
-                    else {}
+    def _normalize_master_location(master, font, axis_min_max):
+        """Get normalized location for a master."""
+        loc = {}
+        for i, axis in enumerate(font.axes):
+            tag = axis.axisTag
+            if tag in axis_min_max:
+                min_v, max_v = axis_min_max[tag]
+                loc[tag] = (
+                    (master.internalAxesValues[i] - min_v) / (max_v - min_v)
+                    if max_v != min_v
+                    else 0.0
                 )
-                print(
-                    f"[Interpol] get_intermediate_layers_for_glyph: checking layer '{layer.name}', "
-                    f"is_intermediate={is_intermediate}, attrs={attrs}"
-                )
-
-            if is_intermediate:
-                coords = SpecialLayerHelper.get_intermediate_layer_coordinates(
-                    layer, font
-                )
-                if DEBUG_INTERPOLATE:
-                    print(f"[Interpol]   -> coordinates: {coords}")
-                if coords:
-                    # Check compatibility
-                    try:
-                        decomposed = layer.copyDecomposedLayer()
-                        point_count = sum(len(path.nodes) for path in decomposed.paths)
-                        if point_count == ref_point_count:
-                            result.append((layer, coords))
-                            if DEBUG_INTERPOLATE:
-                                print(
-                                    f"[Interpol]   -> ADDED (compatible, {point_count} points)"
-                                )
-                        elif DEBUG_INTERPOLATE:
-                            print(
-                                f"[Interpol]   -> SKIPPED (incompatible: {point_count} vs {ref_point_count} points)"
-                            )
-                    except Exception as e:
-                        if DEBUG_INTERPOLATE:
-                            print(f"[Interpol]   -> ERROR checking compatibility: {e}")
-
-        return result
-
-    @staticmethod
-    def get_alternate_layers_for_glyph(
-        glyph, font
-    ) -> Dict[str, List[Tuple[Any, Dict[str, Dict[str, float]]]]]:
-        """
-        Get all alternate layers for a glyph, grouped by their rules.
-
-        Args:
-            glyph: A GSGlyph
-            font: The GSFont
-
-        Returns:
-            Dict mapping rule signature to list of (layer, rules) tuples.
-            Each rule signature represents a "set" of alternate layers that should
-            be used together (they have the same axisRules and are associated
-            with different masters).
-        """
-        result = {}
-        if not glyph or not font:
-            return result
-
-        for layer in glyph.layers:
-            if SpecialLayerHelper.is_alternate_layer(layer):
-                rules = SpecialLayerHelper.get_alternate_layer_rules(layer, font)
-                if rules:
-                    # Create a hashable signature from the rules
-                    rule_sig = SpecialLayerHelper._rules_to_signature(rules)
-                    if rule_sig not in result:
-                        result[rule_sig] = []
-                    result[rule_sig].append((layer, rules))
-
-        return result
-
-    @staticmethod
-    def _rules_to_signature(rules: Dict[str, Dict[str, float]]) -> str:
-        """Convert rules dict to a hashable string signature."""
-        parts = []
-        for axis_tag in sorted(rules.keys()):
-            rule = rules[axis_tag]
-            min_v = rule.get("min", "")
-            max_v = rule.get("max", "")
-            parts.append(f"{axis_tag}:{min_v}-{max_v}")
-        return "|".join(parts)
-
-    @staticmethod
-    def get_active_alternate_set(
-        glyph,
-        font,
-        location: Dict[str, float],
-        axis_min_max: Dict[str, Tuple[float, float]],
-    ) -> Optional[List[Tuple[Any, str]]]:
-        """
-        Get the set of alternate layers that should be active at a given location.
-
-        Args:
-            glyph: A GSGlyph
-            font: The GSFont
-            location: Dict mapping axis tags to normalized values (0-1)
-            axis_min_max: Dict mapping axis tags to (min, max) design space values
-
-        Returns:
-            List of (layer, associated_master_id) tuples if alternates are active,
-            or None if no alternate set is active (use master layers instead)
-        """
-        alternate_sets = SpecialLayerHelper.get_alternate_layers_for_glyph(glyph, font)
-
-        for rule_sig, layers_and_rules in alternate_sets.items():
-            if not layers_and_rules:
-                continue
-
-            # Check if this set's rules match the current location
-            # (use the first layer's rules since all in the set have same rules)
-            _, rules = layers_and_rules[0]
-
-            if SpecialLayerHelper.is_location_in_alternate_scope(
-                location, axis_min_max, rules
-            ):
-                # This alternate set is active
-                # Return layers with their associated master IDs
-                result = []
-                for layer, _ in layers_and_rules:
-                    master_id = layer.associatedMasterId
-                    result.append((layer, master_id))
-                return result
-
-        return None
+        return loc
 
     @staticmethod
     def collect_interpolation_sources(
         glyph,
         font,
-        location: Dict[str, float],
-        axis_min_max: Dict[str, Tuple[float, float]],
-        include_intermediates: bool = True,
-        include_alternates: bool = True,
-    ) -> Tuple[List[Any], List[Dict[str, float]], bool]:
+        location,
+        axis_min_max,
+        include_intermediates=True,
+        include_alternates=True,
+    ):
         """
-        Collect all layers that should participate in interpolation at a given location.
-
-        This is the main entry point for the interpolation system. It handles:
-        1. Checking if alternate layers should be used instead of masters
-        2. Including intermediate layers as additional sources
-        3. Building the list of designspace locations for each source
-
-        Args:
-            glyph: A GSGlyph
-            font: The GSFont
-            location: Current interpolation location (normalized 0-1 per axis)
-            axis_min_max: Dict mapping axis tags to (min, max) design space values
-            include_intermediates: Whether to include intermediate (brace) layers
-            include_alternates: Whether to include alternate (bracket) layers
-
-        Returns:
-            Tuple of (layers_list, locations_list, uses_special_layers) where:
-            - layers_list: List of layers to use for interpolation
-            - locations_list: Corresponding normalized locations for VariationModel
-            - uses_special_layers: True if alternates or intermediates are in use
+        Collect layers + locations for interpolation. Returns (layers, locations, uses_special).
         """
-        layers = []
-        locations = []
-        axes = list(font.axes)
-        uses_special_layers = False
+        layers, locations = [], []
+        uses_special = False
 
-        # Debug: Log what we're starting with
-        if DEBUG_INTERPOLATE:
-            print(
-                f"[Interpol] collect_interpolation_sources: glyph={glyph.name}, "
-                f"location={location}, axis_min_max={axis_min_max}, "
-                f"include_intermediates={include_intermediates}, include_alternates={include_alternates}"
-            )
-            # Log all layers for this glyph
-            for layer in glyph.layers:
-                is_master = hasattr(layer, "isMasterLayer") and layer.isMasterLayer
-                is_intermediate = SpecialLayerHelper.is_intermediate_layer(layer)
-                is_alternate = SpecialLayerHelper.is_alternate_layer(layer)
-                attrs = (
-                    dict(layer.attributes)
-                    if hasattr(layer, "attributes") and layer.attributes
-                    else {}
-                )
-                print(
-                    f"[Interpol]   Layer: '{layer.name}' (layerId={layer.layerId[:8]}..., "
-                    f"master={is_master}, intermediate={is_intermediate}, alternate={is_alternate}, "
-                    f"attrs={list(attrs.keys())})"
-                )
-
-        # First check if alternate layers are active (only if enabled)
-        active_alternates = None
+        # Find active alternates (same axisRules, different masters)
+        active_alts = {}  # master_id -> layer
         if include_alternates:
-            active_alternates = SpecialLayerHelper.get_active_alternate_set(
-                glyph, font, location, axis_min_max
-            )
-
-        if DEBUG_INTERPOLATE:
-            print(f"[Interpol] active_alternates: {active_alternates is not None}")
-
-        if active_alternates:
-            if DEBUG_INTERPOLATE:
-                print(f"[Interpol] Using {len(active_alternates)} alternate layers")
-            uses_special_layers = True
-            # Use alternate layers instead of master layers
-            for alt_layer, master_id in active_alternates:
-                # Find the master to get its coordinates
-                for master in font.masters:
-                    if master.id == master_id:
-                        # Build normalized location for this alternate layer
-                        norm_loc = {}
-                        for i, axis in enumerate(axes):
-                            axis_tag = axis.axisTag
-                            if axis_tag in axis_min_max:
-                                min_val, max_val = axis_min_max[axis_tag]
-                                if max_val != min_val:
-                                    master_val = master.internalAxesValues[i]
-                                    norm_loc[axis_tag] = (master_val - min_val) / (
-                                        max_val - min_val
-                                    )
-                                else:
-                                    norm_loc[axis_tag] = 0.0
-                        layers.append(alt_layer)
-                        locations.append(norm_loc)
-                        break
-        else:
-            # Use master layers
-            for master in font.masters:
-                layer = glyph.layers[master.id]
-                if layer:
-                    # Build normalized location for this master
-                    norm_loc = {}
-                    for i, axis in enumerate(axes):
-                        axis_tag = axis.axisTag
-                        if axis_tag in axis_min_max:
-                            min_val, max_val = axis_min_max[axis_tag]
-                            if max_val != min_val:
-                                master_val = master.internalAxesValues[i]
-                                norm_loc[axis_tag] = (master_val - min_val) / (
-                                    max_val - min_val
-                                )
-                            else:
-                                norm_loc[axis_tag] = 0.0
-                    layers.append(layer)
-                    locations.append(norm_loc)
-
-        # Now add intermediate layers (only if enabled)
-        if include_intermediates:
-            intermediate_layers = SpecialLayerHelper.get_intermediate_layers_for_glyph(
-                glyph, font
-            )
-
-            for int_layer, coords in intermediate_layers:
-                # Check compatibility with existing layers
-                if not layers:
+            for layer in glyph.layers:
+                if hasattr(layer, "isMasterLayer") and layer.isMasterLayer:
                     continue
+                rules = SpecialLayerHelper._parse_rules(
+                    SpecialLayerHelper._get_layer_attr(layer, "axisRules"), font
+                )
+                if rules and SpecialLayerHelper._location_matches_rules(
+                    location, axis_min_max, rules
+                ):
+                    active_alts[layer.associatedMasterId] = layer
+                    uses_special = True
 
+        # Collect base sources (alternates replace their masters)
+        for master in font.masters:
+            layer = active_alts.get(master.id) if active_alts else None
+            if not layer:
+                layer = glyph.layers[master.id]
+            if layer:
+                layers.append(layer)
+                locations.append(
+                    SpecialLayerHelper._normalize_master_location(
+                        master, font, axis_min_max
+                    )
+                )
+
+        # Add compatible intermediate layers
+        if include_intermediates and layers:
+            try:
+                ref_pts = sum(
+                    len(p.nodes) for p in layers[0].copyDecomposedLayer().paths
+                )
+            except Exception:
+                ref_pts = -1
+            for layer in glyph.layers:
+                if hasattr(layer, "isMasterLayer") and layer.isMasterLayer:
+                    continue
+                coords = SpecialLayerHelper._parse_coords(
+                    SpecialLayerHelper._get_layer_attr(layer, "coordinates"), font
+                )
+                if not coords:
+                    continue
                 try:
-                    ref_decomposed = layers[0].copyDecomposedLayer()
-                    ref_point_count = sum(
-                        len(path.nodes) for path in ref_decomposed.paths
-                    )
-                    int_decomposed = int_layer.copyDecomposedLayer()
-                    int_point_count = sum(
-                        len(path.nodes) for path in int_decomposed.paths
-                    )
-
-                    if int_point_count != ref_point_count:
-                        continue  # Skip incompatible intermediate layers
+                    if (
+                        sum(len(p.nodes) for p in layer.copyDecomposedLayer().paths)
+                        != ref_pts
+                    ):
+                        continue
                 except Exception:
                     continue
+                # Build normalized location
+                loc = {}
+                for axis in font.axes:
+                    tag = axis.axisTag
+                    if tag in coords and tag in axis_min_max:
+                        min_v, max_v = axis_min_max[tag]
+                        loc[tag] = (
+                            (coords[tag] - min_v) / (max_v - min_v)
+                            if max_v != min_v
+                            else 0.0
+                        )
+                    elif tag in axis_min_max and locations:
+                        loc[tag] = locations[0].get(tag, 0.0)
+                # Avoid duplicates
+                if tuple(sorted(loc.items())) not in [
+                    tuple(sorted(l.items())) for l in locations
+                ]:
+                    layers.append(layer)
+                    locations.append(loc)
+                    uses_special = True
 
-                uses_special_layers = True  # Mark that we have intermediate layers
-
-                # Build normalized location for this intermediate layer
-                norm_loc = {}
-                for axis in axes:
-                    axis_tag = axis.axisTag
-                    if axis_tag in coords and axis_tag in axis_min_max:
-                        min_val, max_val = axis_min_max[axis_tag]
-                        if max_val != min_val:
-                            norm_loc[axis_tag] = (coords[axis_tag] - min_val) / (
-                                max_val - min_val
-                            )
-                        else:
-                            norm_loc[axis_tag] = 0.0
-                    elif axis_tag in axis_min_max and locations:
-                        # Use interpolated value from masters if not specified
-                        # For now, use first master's value as fallback
-                        norm_loc[axis_tag] = locations[0].get(axis_tag, 0.0)
-
-                # Check for duplicate locations (would break VariationModel)
-                loc_tuple = tuple(sorted(norm_loc.items()))
-                existing_locs = [tuple(sorted(l.items())) for l in locations]
-                if loc_tuple not in existing_locs:
-                    layers.append(int_layer)
-                    locations.append(norm_loc)
-
-        return layers, locations, uses_special_layers
+        return layers, locations, uses_special
 
 
 # =============================================================================
