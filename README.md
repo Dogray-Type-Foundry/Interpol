@@ -164,12 +164,28 @@ Gives you full control over how the dekinking process works.
 
 - **Compensate Curves** (checkbox) - When enabled, attempts to preserve the original curve shape by adjusting handle positions and lengths proportionally
 
-**Auto (Preserve Shape) Mode:**
-Automatically finds the best balance between dekinking and preserving the original curve shapes. This mode:
-- Analyzes curve shapes using bezier math
-- Calculates optimal adjustments to minimize both kinks and shape distortion
-- Works well for most cases without manual tuning
-- Uses a maximum deviation threshold (25 units) to prevent excessive changes
+**Auto (Statistics-based) Mode:**
+Automatically finds the best balance between dekinking and preserving the original curve shapes using fontTools' StatisticsPen for curve analysis. This mode uses a **two-pass approach** to minimize curvature change across all masters:
+
+**Curve Analysis:**
+- Computes statistical properties of curves (area, variance, correlation, slant) to capture curve "behavior"
+- Analyzes cross-master curve similarity to decide how aggressively to dekink
+- Uses binary search to find the optimal blend factor that meets a quality threshold
+
+**Two-Pass Dynamic Weighting:**
+Instead of treating all masters equally, the algorithm uses a two-pass approach:
+
+1. **First Pass - Movement Analysis (60% weight):** The algorithm simulates dekinking with a simple average ratio to measure how much each master's nodes and handles would actually move. Masters that would move the most get protected—the target ratio is adjusted toward their values so other masters absorb more of the change instead.
+
+2. **Worst Kink Region Detection (40% weight):** The algorithm identifies where in the designspace the worst kinking occurs (where ratios differ most dramatically) and allows masters near that region to absorb more change.
+
+**How it works:**
+- The **target ratio** is computed as a weighted average, pulling toward masters that would otherwise move too much
+- Each master gets a **personalized blend limit** based on its weight
+- Masters that would distort most have stricter limits on how much they can change
+- This ensures no single master gets dramatically altered while still resolving the kink
+
+This approach works especially well when one "outlier" master has a very different ratio from the others—instead of forcing that master to change dramatically, the algorithm makes the other masters adapt more.
 
 #### Selection Counter
 Shows how many smooth points are selected and how many have kinks:
@@ -236,6 +252,6 @@ Click **”Reset to Defaults”** to restore all original settings.
 
 ---
 
-**Version:** 3.0  
+**Version:** 4.0
 **Author:** José Solé @ Dogray Type Foundry
 **License:** Apache-2.0

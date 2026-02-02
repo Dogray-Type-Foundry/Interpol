@@ -13,9 +13,9 @@
 	<key>CFBundleName</key>
 	<string>Interpol</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string> <!-- 1.0 -->
+	<string>4.0</string>
 	<key>CFBundleVersion</key>
-	<string>100</string> <!-- 123 -->
+	<string>400</string>
 	<key>Principal Classes</key>
 	<array>
 		<string>InterpolateReporter</string>
